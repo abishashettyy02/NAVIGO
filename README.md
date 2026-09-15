@@ -70,6 +70,10 @@ The included `render.yaml` and `Dockerfile` deploy the web client and Socket.IO 
 4. After Render gives you a URL, set `CLIENT_ORIGIN` to that exact URL and add the URL to the browser key's website restrictions.
 5. Redeploy once after updating the origin and key restrictions.
 
+## Accounts storage
+
+Passenger and driver accounts are stored in a SQLite database file (`better-sqlite3`), not in server memory, so they survive restarts. It lives at `USERS_DB_PATH`, defaulting to `data/users.db` next to the project. Passwords are always stored as a bcrypt hash, never as plain text. On Render, `render.yaml` attaches a small persistent disk at `/app/data` and points `USERS_DB_PATH` there — without a persistent disk, any container filesystem resets on redeploy and accounts would be lost, so keep that disk attached (or point `USERS_DB_PATH` at a managed volume) before public launch.
+
 ## Production limitation
 
-The starter stores accounts and bus state in server memory. That is sufficient for a live demo but resets after a service restart and does not support multiple server instances. Before public launch, add a managed database (for example PostgreSQL) and a shared Socket.IO adapter such as Redis.
+Live bus positions still live in server memory, which is fine for a single instance but resets after a restart and does not support multiple server instances. Before scaling past one instance, add a shared Socket.IO adapter such as Redis and, if needed, move bus state to the same database.

@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import fs from 'fs';
 import express from 'express';
 import http from 'http';
 import path from 'path';
@@ -9,6 +10,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import nodemailer from 'nodemailer';
 import XLSX from 'xlsx';
+import Database from 'better-sqlite3';
 import { Server } from 'socket.io';
 
 dotenv.config();
@@ -62,7 +64,41 @@ function loadWorkbook() {
 }
 
 const transit = loadWorkbook();
-const users = new Map();
+
+// Passenger and driver accounts persist in a SQLite database file on disk, so accounts survive
+// server restarts. Only a bcrypt hash of the password is ever stored — never the plain text.
+const usersDbPath = process.env.USERS_DB_PATH || path.resolve(projectRoot, 'data', 'users.db');
+fs.mkdirSync(path.dirname(usersDbPath), { recursive: true });
+const usersDb = new Database(usersDbPath);
+usersDb.pragma('journal_mode = WAL');
+usersDb.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL,
+    bus_id TEXT,
+    session_version TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )
+`);
+const selectUserByEmailStatement = usersDb.prepare('SELECT * FROM users WHERE email = ?');
+const upsertUserStatement = usersDb.prepare(`
+  INSERT INTO users (id, email, password_hash, role, bus_id, session_version, created_at)
+  VALUES (@id, @email, @password, @role, @busId, @sessionVersion, @createdAt)
+  ON CONFLICT(email) DO UPDATE SET
+    password_hash = excluded.password_hash,
+    role = excluded.role,
+    bus_id = excluded.bus_id,
+    session_version = excluded.session_version
+`);
+// The email UNIQUE constraint above is what makes duplicate accounts impossible at the database
+// level; saveUser() always upserts by email so re-verifying an existing address updates that
+// same row instead of creating a second account.
+const rowToUser = row => row && { id: row.id, email: row.email, password: row.password_hash, role: row.role, busId: row.bus_id, sessionVersion: row.session_version };
+const getUserByEmail = email => rowToUser(selectUserByEmailStatement.get(email));
+const saveUser = user => { upsertUserStatement.run({ ...user, createdAt: Date.now() }); return user; };
+
 const pendingCodes = new Map();
 const buses = new Map(transit.buses.map(bus => [bus.id, bus]));
 const deviceRegistry = new Map(configuredDevices.filter(item => item?.deviceId && item?.busId).map(item => [String(item.deviceId), { busId: String(item.busId), ip: item.ip ? String(item.ip) : null }]));
@@ -72,7 +108,7 @@ const tokenFor = user => jwt.sign({ ...publicUser(user), sessionVersion: user.se
 const auth = roles => (req, res, next) => {
   try {
     const user = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), secret);
-    const currentUser = users.get(user.email);
+    const currentUser = getUserByEmail(user.email);
     if (!currentUser || currentUser.sessionVersion !== user.sessionVersion) throw new Error('Session is no longer valid');
     if (roles && !roles.includes(user.role)) return res.status(403).json({ message: 'Forbidden' });
     req.user = user;
@@ -134,7 +170,7 @@ app.post('/api/auth/request-code', async (req, res) => {
   if (!mailer) return res.status(503).json({ message: 'Email verification is not configured. Add Gmail settings to .env.' });
   const code = crypto.randomInt(100000, 1000000).toString();
   pendingCodes.set(email, { code, password: await bcrypt.hash(password, 12), role: isDriver ? 'driver' : 'passenger', busId: isDriver ? String(busId).trim() : null, sentAt: Date.now(), expiresAt: Date.now() + 600000, attempts: 0 });
-  try { await mailer.sendMail({ from: `NAVIGO <${process.env.GMAIL_USER}>`, to: email, subject: 'Your NAVIGO verification code', text: `Your NAVIGO verification code is ${code}. It expires in 10 minutes.`, html: `<p>Your NAVIGO verification code is</p><h1>${code}</h1><p>It expires in 10 minutes.</p>` }); res.status(202).json({ message: users.has(email) ? 'Verification code sent. Verifying it will replace your old password and sign out previous sessions.' : 'Verification code sent.' }); }
+  try { await mailer.sendMail({ from: `NAVIGO <${process.env.GMAIL_USER}>`, to: email, subject: 'Your NAVIGO verification code', text: `Your NAVIGO verification code is ${code}. It expires in 10 minutes.`, html: `<p>Your NAVIGO verification code is</p><h1>${code}</h1><p>It expires in 10 minutes.</p>` }); res.status(202).json({ message: getUserByEmail(email) ? 'Verification code sent. Verifying it will replace your old password and sign out previous sessions.' : 'Verification code sent.' }); }
   catch (error) { pendingCodes.delete(email); console.error(error.message); res.status(502).json({ message: 'We could not send the verification email. Check your Gmail settings.' }); }
 });
 
@@ -144,13 +180,13 @@ app.post('/api/auth/verify-code', (req, res) => {
   if (!pending || pending.expiresAt < Date.now()) { pendingCodes.delete(email); return res.status(400).json({ message: 'This code has expired. Request a new one.' }); }
   if (++pending.attempts > 5) { pendingCodes.delete(email); return res.status(429).json({ message: 'Too many attempts. Request a new code.' }); }
   if (String(req.body.code).trim() !== pending.code) return res.status(400).json({ message: 'That verification code is incorrect.' });
-  const oldUser = users.get(email);
-  const user = { id: oldUser?.id || crypto.randomUUID(), email, role: pending.role, busId: pending.busId, password: pending.password, sessionVersion: crypto.randomUUID() }; users.set(user.email, user); pendingCodes.delete(user.email);
+  const oldUser = getUserByEmail(email);
+  const user = { id: oldUser?.id || crypto.randomUUID(), email, role: pending.role, busId: pending.busId, password: pending.password, sessionVersion: crypto.randomUUID() }; saveUser(user); pendingCodes.delete(user.email);
   res.status(201).json({ token: tokenFor(user), user: publicUser(user) });
 });
 
 app.post('/api/auth/login', async (req, res) => {
-  const user = users.get(String(req.body.email || '').trim().toLowerCase());
+  const user = getUserByEmail(String(req.body.email || '').trim().toLowerCase());
   if (!user || !await bcrypt.compare(req.body.password || '', user.password)) return res.status(401).json({ message: 'Incorrect email or password.' });
   if (user.role === 'driver' && String(req.body.busId || '').trim() !== user.busId) return res.status(403).json({ message: 'Enter the bus ID assigned to this driver account.' });
   res.json({ token: tokenFor(user), user: publicUser(user) });

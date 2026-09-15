@@ -4,6 +4,10 @@ services:
     runtime: docker
     plan: starter
     healthCheckPath: /api/health
+    disk:
+      name: navigo-data
+      mountPath: /app/data
+      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
@@ -15,3 +19,5 @@ services:
         sync: false
       - key: CLIENT_ORIGIN
         sync: false
+      - key: USERS_DB_PATH
+        value: /app/data/users.db

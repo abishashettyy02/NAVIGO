@@ -5,6 +5,7 @@ import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || '/api';
 const fresh = bus => bus.updatedAt && Date.now() - bus.updatedAt < 300000;
+const HARDWARE_STALE_MS = 60000; // no update from the bus GPS device in the last minute counts as offline
 
 function loadMaps(key) { if (window.google?.maps) return Promise.resolve(window.google.maps); if (window.navigoMapsPromise) return window.navigoMapsPromise; window.navigoMapsPromise = new Promise((resolve, reject) => { const s = document.createElement('script'); s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&libraries=geometry&loading=async`; s.async = true; s.onload = () => resolve(window.google.maps); s.onerror = reject; document.head.append(s); }); return window.navigoMapsPromise; }
 function LiveMap({ buses, customer, arrival }) {
@@ -19,6 +20,88 @@ function AuthV2({ done }) { const [role, setRole] = useState('passenger'); const
 function Arrival({ item, selected, select }) { const route = item.routeId?.split('-')[0]?.toUpperCase() || 'LIVE'; return <button className={`arrival-card ${selected ? 'selected' : ''}`} onClick={select}><div className="route-chip">{route}</div><div className="arrival-main"><strong>{item.etaMinutes ? `${item.etaMinutes} min` : 'Calculating...'}</strong><span>{item.id} · {item.operator || 'Live bus'}</span></div><div className="distance">{item.distanceKm ? `${item.distanceKm} km` : 'Live'}<small>{item.source === 'hardware' ? 'GPS device' : 'Shared location'}</small></div></button>; }
 function Dashboard({ session, logout }) { const buses = useBuses(); const [customer, setCustomer] = useState(null); const [arrivals, setArrivals] = useState([]); const [selected, setSelected] = useState(null); const [status, setStatus] = useState('Share your location to find buses approaching you.'); const [busy, setBusy] = useState(false); async function calculate(coords) { setBusy(true); setStatus('Finding traffic-aware arrival estimates...'); try { const r = await fetch(`${API}/arrivals`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify(coords) }); const data = await r.json(); if (!r.ok) throw new Error(data.message); setArrivals(data.arrivals); setSelected(data.arrivals[0] || null); setStatus(data.arrivals.length ? `Updated just now using ${data.provider}.` : 'No bus has shared a recent location yet.'); } catch (err) { setStatus(err.message); } finally { setBusy(false); } } function locate() { if (!navigator.geolocation) return setStatus('This browser does not support location sharing.'); setStatus('Requesting your location...'); navigator.geolocation.getCurrentPosition(p => { const c = { lat: p.coords.latitude, lng: p.coords.longitude }; setCustomer(c); calculate(c); }, () => setStatus('Location permission was not granted. Try again when ready.'), { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 }); } useEffect(() => { if (!customer) return; const id = setInterval(() => calculate(customer), 60000); return () => clearInterval(id); }, [customer]); const live = buses.filter(fresh).length; return <main className="dashboard"><header><div className="wordmark"><span>N</span> NAVIGO <small>LIVE</small></div><div className="account"><span>{session.user.email}</span><button className="text-button" onClick={logout}>Sign out</button></div></header><section className="dashboard-hero"><div><p className="eyebrow">LIVE ARRIVALS</p><h1>When is my bus coming?</h1><p>See the latest location and expected arrival time for buses near you.</p><button className="primary location-button" onClick={locate} disabled={busy}>{busy ? 'Updating arrivals...' : customer ? 'Refresh arrivals' : 'Use my location'}</button></div><div className="live-orb"><strong>{live}</strong><span>buses<br />live now</span></div></section><section className="map-shell"><LiveMap buses={buses} customer={customer} arrival={selected} /><div className="map-legend"><span className="legend-dot customer" /> Your location <span className="legend-dot bus" /> Bus</div>{selected?.etaMinutes && <div className="eta-bubble"><span>Estimated arrival</span><strong>{selected.etaMinutes} min</strong></div>}</section><section className="arrivals-panel"><div className="section-heading"><div><p className="eyebrow">ARRIVALS</p><h2>Nearby buses</h2></div><span className="status-pill"><i /> {live ? 'Live tracking' : 'No active tracking'}</span></div><p className="notice">{status}</p><div className="arrival-list">{arrivals.map(item => <Arrival key={item.id} item={item} selected={selected?.id === item.id} select={() => setSelected(item)} />)}{!arrivals.length && <div className="empty-state"><strong>No arrivals to show yet</strong><span>Choose “Use my location” once your bus starts sharing its live location.</span></div>}</div></section><section className="how-it-works"><span>Live GPS updates</span><span>Traffic-aware travel time</span><span>Arrival updates every minute</span></section></main>; }
 function DriverConsole({ session, logout }) { const buses = useBuses(); const bus = buses.find(item => item.id === session.user.busId); const online = bus && fresh(bus); return <main className="dashboard driver-console"><header><div className="wordmark"><span>N</span> NAVIGO <small>DRIVER</small></div><div className="account"><span>{session.user.email}</span><button className="text-button" onClick={logout}>Sign out</button></div></header><section className="driver-header"><div><p className="eyebrow">DRIVER CONSOLE</p><h1>Today’s bus status</h1><p>This account is assigned to bus <strong>{session.user.busId}</strong>. Keep its GPS unit powered so customers can see live arrival times.</p></div><span className={`connection ${online ? 'online' : ''}`}><i /> {online ? 'Device connected' : 'Waiting for device'}</span></section><section className="driver-grid"><article className="driver-card"><p className="field-label">ASSIGNED BUS</p><div className="bus-status"><span className="route-chip">{bus?.routeId?.split('-')[0]?.toUpperCase() || '—'}</span><div><strong>{session.user.busId}</strong><span>{bus?.operator || 'Bus assignment verified'}</span></div></div><dl><div><dt>GPS update</dt><dd>{online ? 'Receiving live location' : 'No recent update'}</dd></div><div><dt>Passenger visibility</dt><dd>{online ? 'Visible in customer app' : 'Not visible yet'}</dd></div><div><dt>Occupancy</dt><dd>{bus?.occupancy || 'Not reported'}</dd></div></dl></article><article className="driver-card help-card"><p className="eyebrow">DEVICE CHECK</p><h2>Before leaving</h2><ol><li>Connect the GPS device to power.</li><li>Make sure its mobile data is on.</li><li>Wait for “Device connected” above.</li></ol><p className="notice">The device sends the location automatically. There is nothing to update while driving.</p></article></section><section className="map-shell driver-map"><LiveMap buses={bus ? [bus] : []} /><div className="map-legend"><span className="legend-dot bus" /> Assigned bus location</div></section></main>; }
-function DriverConsoleV2({ session, logout }) { const [bus, setBus] = useState(null); const [sharing, setSharing] = useState(false); const [status, setStatus] = useState('GPS device is the primary source for this bus.'); useEffect(() => { fetch(`${API}/driver/bus`, { headers: { Authorization: `Bearer ${session.token}` } }).then(r => r.json()).then(setBus).catch(() => setStatus('Could not load assigned bus status.')); }, [session.token]); useEffect(() => { if (!sharing) return; if (!navigator.geolocation) { setStatus('This browser does not support live location sharing.'); setSharing(false); return; } const watch = navigator.geolocation.watchPosition(async position => { try { const r = await fetch(`${API}/driver/location`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ lat: position.coords.latitude, lng: position.coords.longitude, occupancy: bus?.occupancy || 'Moderate' }) }); if (!r.ok) throw new Error('Location update was rejected.'); setBus(current => ({ ...current, lat: position.coords.latitude, lng: position.coords.longitude, updatedAt: Date.now(), source: 'driver' })); setStatus(`Sharing your phone location · updated ${new Date().toLocaleTimeString()}`); } catch (error) { setStatus(error.message); } }, () => { setStatus('Location permission was denied.'); setSharing(false); }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }); return () => navigator.geolocation.clearWatch(watch); }, [sharing, session.token, bus?.occupancy]); const online = bus && fresh(bus); return <main className="dashboard driver-console"><header><div className="wordmark"><span>N</span> NAVIGO <small>DRIVER</small></div><div className="account"><span>{session.user.email}</span><button className="text-button" onClick={logout}>Sign out</button></div></header><section className="driver-header"><div><p className="eyebrow">DRIVER CONSOLE</p><h1>Your assigned bus</h1><p>Bus ID <strong>{session.user.busId}</strong> is locked to this account. Your GPS device connects to it in the backend.</p></div><span className={`connection ${online ? 'online' : ''}`}><i /> {online ? 'Tracking active' : 'No recent tracking'}</span></section><section className="driver-grid"><article className="driver-card"><p className="field-label">ASSIGNED BUS</p><div className="bus-status"><span className="route-chip">{bus?.routeId?.split('-')[0]?.toUpperCase() || '—'}</span><div><strong>{session.user.busId}</strong><span>{bus?.operator || 'Bus assignment verified'}</span></div></div><dl><div><dt>Live source</dt><dd>{sharing ? 'Driver phone' : bus?.source === 'hardware' ? 'GPS device' : 'Not connected'}</dd></div><div><dt>Last update</dt><dd>{bus?.updatedAt ? new Date(bus.updatedAt).toLocaleTimeString() : '—'}</dd></div><div><dt>Customers</dt><dd>{online ? 'Can see your bus' : 'Waiting for location'}</dd></div></dl></article><article className="driver-card help-card"><p className="eyebrow">BACKUP LOCATION</p><h2>GPS device not working?</h2><p>Use your phone only as a temporary backup. It shares your location with customers for this bus.</p><button className={sharing ? 'stop-sharing' : 'primary'} onClick={() => { setSharing(value => !value); setStatus(sharing ? 'Phone location sharing stopped.' : 'Requesting phone location permission...'); }}>{sharing ? 'Stop sharing location' : 'Share my live location'}</button><p className="notice">{status}</p></article></section><section className="map-shell driver-map"><LiveMap buses={bus ? [bus] : []} /><div className="map-legend"><span className="legend-dot bus" /> Assigned bus location</div></section></main>; }
+function DriverConsoleV2({ session, logout }) {
+  // Live bus state comes from the same socket-backed hook the passenger dashboard uses, so
+  // this console reacts instantly to both hardware GPS pings and driver-shared updates.
+  const buses = useBuses();
+  const bus = buses.find(item => item.id === session.user.busId);
+
+  const [loaded, setLoaded] = useState(false);
+  const [hardwareLastSeen, setHardwareLastSeen] = useState(null);
+  const [, tick] = useState(0);
+  const [sharing, setSharing] = useState(false);
+  const [permissionDenied, setPermissionDenied] = useState(false);
+  const [promptDismissed, setPromptDismissed] = useState(false);
+  const [status, setStatus] = useState('Bus GPS device is the primary source for this bus.');
+
+  useEffect(() => { if (buses.length) setLoaded(true); }, [buses.length]);
+  // Track the most recent moment the hardware device itself reported in, independent of
+  // whichever source last overwrote the bus record — this is what "GPS device offline" means.
+  useEffect(() => { if (bus?.source === 'hardware' && bus.updatedAt) setHardwareLastSeen(current => Math.max(current || 0, bus.updatedAt)); }, [bus?.source, bus?.updatedAt]);
+  useEffect(() => { const id = setInterval(() => tick(t => t + 1), 15000); return () => clearInterval(id); }, []);
+
+  const hardwareOnline = !!hardwareLastSeen && Date.now() - hardwareLastSeen < HARDWARE_STALE_MS;
+  // Once the device comes back, forget the earlier dismissal so a future outage prompts again.
+  useEffect(() => { if (hardwareOnline) setPromptDismissed(false); }, [hardwareOnline]);
+  const showPrompt = loaded && !sharing && !hardwareOnline && !promptDismissed;
+  const activeSource = sharing ? 'driver' : hardwareOnline ? 'hardware' : 'none';
+  const online = activeSource !== 'none';
+  const sourceLabel = activeSource === 'driver' ? 'Driver Device Location' : activeSource === 'hardware' ? 'Bus GPS Device' : 'No live location';
+
+  function startSharing() {
+    setPromptDismissed(true);
+    if (!navigator.geolocation) { setStatus('This browser does not support live location sharing.'); return; }
+    setStatus('Requesting device location permission...');
+    navigator.geolocation.getCurrentPosition(
+      () => { setPermissionDenied(false); setSharing(true); },
+      error => { setSharing(false); setPermissionDenied(error.code === error.PERMISSION_DENIED); setStatus(error.code === error.PERMISSION_DENIED ? 'Location permission was denied. Tap "Try again" once you enable it.' : 'Could not get your device location. Try again.'); },
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+    );
+  }
+  function stopSharing() { setSharing(false); setStatus(hardwareOnline ? 'Stopped sharing your device location. Back to the bus GPS device.' : 'Stopped sharing your device location.'); }
+
+  useEffect(() => {
+    if (!sharing) return;
+    if (!navigator.geolocation) { setStatus('This browser does not support live location sharing.'); setSharing(false); return; }
+    const watch = navigator.geolocation.watchPosition(async position => {
+      try {
+        const r = await fetch(`${API}/driver/location`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ lat: position.coords.latitude, lng: position.coords.longitude, occupancy: bus?.occupancy || 'Moderate' }) });
+        if (!r.ok) throw new Error('Location update was rejected.');
+        setStatus(`Sharing your device location · updated ${new Date().toLocaleTimeString()}`);
+      } catch (error) { setStatus(error.message); }
+    }, () => { setStatus('Location permission was denied.'); setPermissionDenied(true); setSharing(false); }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 });
+    return () => navigator.geolocation.clearWatch(watch);
+  }, [sharing, session.token, bus?.occupancy]);
+
+  return <main className="dashboard driver-console">
+    <header><div className="wordmark"><span>N</span> NAVIGO <small>DRIVER</small></div><div className="account"><span>{session.user.email}</span><button className="text-button" onClick={logout}>Sign out</button></div></header>
+    <section className="driver-header">
+      <div><p className="eyebrow">DRIVER CONSOLE</p><h1>Your assigned bus</h1><p>Bus ID <strong>{session.user.busId}</strong> is locked to this account. Your GPS device connects to it in the backend.</p></div>
+      <span className={`connection ${online ? 'online' : ''}`}><i /> {online ? `Tracking active · ${sourceLabel}` : 'No recent tracking'}</span>
+    </section>
+    {showPrompt && <div className="gps-alert">
+      <div><strong>Bus GPS device is unavailable.</strong><p>Use your device location as the bus location?</p></div>
+      <div className="gps-alert-actions"><button className="primary" onClick={startSharing}>Yes, use my location</button><button type="button" className="text-button" onClick={() => setPromptDismissed(true)}>Not now</button></div>
+    </div>}
+    <section className="driver-grid">
+      <article className="driver-card">
+        <p className="field-label">ASSIGNED BUS</p>
+        <div className="bus-status"><span className="route-chip">{bus?.routeId?.split('-')[0]?.toUpperCase() || '—'}</span><div><strong>{session.user.busId}</strong><span>{bus?.operator || 'Bus assignment verified'}</span></div></div>
+        <dl><div><dt>Active source</dt><dd>{sourceLabel}</dd></div><div><dt>Last update</dt><dd>{bus?.updatedAt ? new Date(bus.updatedAt).toLocaleTimeString() : '—'}</dd></div><div><dt>Customers</dt><dd>{online ? 'Can see your bus' : 'Waiting for location'}</dd></div></dl>
+      </article>
+      <article className="driver-card help-card">
+        <p className="eyebrow">DRIVER DEVICE LOCATION</p>
+        <h2>{sharing ? 'Currently sharing your location' : 'GPS device not working?'}</h2>
+        <p>Use your phone, tablet, or laptop only as a temporary backup for this bus. Turn it off and the console switches back to the bus GPS device as soon as it's reporting again.</p>
+        <div className="source-control">
+          <button type="button" role="switch" aria-checked={sharing} className={`source-toggle ${sharing ? 'on' : ''}`} onClick={() => (sharing ? stopSharing() : startSharing())}><span className="source-toggle-knob" /></button>
+          <div className="source-control-copy"><strong>Driver device location</strong><span>{sharing ? 'ON — sharing your live location' : permissionDenied ? 'OFF — permission denied, tap to try again' : 'OFF — tap to share your location'}</span></div>
+        </div>
+        <p className="notice">{status}</p>
+      </article>
+    </section>
+    <section className="map-shell driver-map"><LiveMap buses={bus ? [bus] : []} /><div className="map-legend"><span className="legend-dot bus" /> Assigned bus location</div></section>
+  </main>;
+}
 function App() { const [session, setSession] = useState(null); useEffect(() => { localStorage.removeItem('navigo_session'); }, []); const logout = () => { localStorage.removeItem('navigo_session'); setSession(null); }; if (!session) return <AuthV2 done={setSession} />; return session.user.role === 'driver' ? <DriverConsoleV2 session={session} logout={logout} /> : <Dashboard session={session} logout={logout} />; }
 createRoot(document.getElementById('root')).render(<App />);
