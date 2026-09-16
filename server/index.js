@@ -8,7 +8,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 import XLSX from 'xlsx';
 import Database from 'better-sqlite3';
 import { Server } from 'socket.io';
@@ -102,7 +102,9 @@ const saveUser = user => { upsertUserStatement.run({ ...user, createdAt: Date.no
 const pendingCodes = new Map();
 const buses = new Map(transit.buses.map(bus => [bus.id, bus]));
 const deviceRegistry = new Map(configuredDevices.filter(item => item?.deviceId && item?.busId).map(item => [String(item.deviceId), { busId: String(item.busId), ip: item.ip ? String(item.ip) : null }]));
-const mailer = process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD ? nodemailer.createTransport({ service: 'gmail', auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD } }) : null;
+const resend = process.env.RESEND_API_KEY
+  ? new Resend(process.env.RESEND_API_KEY)
+  : null;
 const publicUser = user => ({ id: user.id, email: user.email, role: user.role, busId: user.busId || null });
 const tokenFor = user => jwt.sign({ ...publicUser(user), sessionVersion: user.sessionVersion }, secret, { expiresIn: '12h' });
 const auth = roles => (req, res, next) => {
@@ -167,10 +169,32 @@ app.post('/api/auth/request-code', async (req, res) => {
   if (!/^\S+@\S+\.\S+$/.test(email) || String(password).length < 8) return res.status(400).json({ message: 'Use a valid email and an 8+ character password.' });
   if (isDriver && (!busId || !buses.has(String(busId).trim()))) return res.status(400).json({ message: 'Enter a valid assigned bus ID to create a driver account.' });
   if (pendingCodes.get(email)?.sentAt > Date.now() - 60_000) return res.status(429).json({ message: 'Please wait a minute before requesting another code.' });
-  if (!mailer) return res.status(503).json({ message: 'Email verification is not configured. Add Gmail settings to .env.' });
+  if (!resend) {
+  return res.status(503).json({
+    message: 'Email verification is not configured. Add RESEND_API_KEY.'
+  });
+}
   const code = crypto.randomInt(100000, 1000000).toString();
   pendingCodes.set(email, { code, password: await bcrypt.hash(password, 12), role: isDriver ? 'driver' : 'passenger', busId: isDriver ? String(busId).trim() : null, sentAt: Date.now(), expiresAt: Date.now() + 600000, attempts: 0 });
-  try { await mailer.sendMail({ from: `NAVIGO <${process.env.GMAIL_USER}>`, to: email, subject: 'Your NAVIGO verification code', text: `Your NAVIGO verification code is ${code}. It expires in 10 minutes.`, html: `<p>Your NAVIGO verification code is</p><h1>${code}</h1><p>It expires in 10 minutes.</p>` }); res.status(202).json({ message: getUserByEmail(email) ? 'Verification code sent. Verifying it will replace your old password and sign out previous sessions.' : 'Verification code sent.' }); }
+  try { const { data, error } = await resend.emails.send({
+  from: 'NAVIGO <onboarding@resend.dev>',
+  to: [email],
+  subject: 'Your NAVIGO verification code',
+  text: `Your NAVIGO verification code is ${code}. It expires in 10 minutes.`,
+  html: `
+    <p>Your NAVIGO verification code is:</p>
+    <h1>${code}</h1>
+    <p>This code expires in 10 minutes.</p>
+  `
+});
+
+if (error) {
+  console.error('Resend email error:', error);
+  throw error;
+}
+
+console.log('Verification email sent:', data);
+res.status(202).json({ message: getUserByEmail(email) ? 'Verification code sent. Verifying it will replace your old password and sign out previous sessions.' : 'Verification code sent.' }); }
   catch (error) { pendingCodes.delete(email); console.error(error.message); res.status(502).json({ message: 'We could not send the verification email. Check your Gmail settings.' }); }
 });
 
