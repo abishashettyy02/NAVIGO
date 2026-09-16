@@ -8,7 +8,6 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import { Resend } from 'resend';
 import XLSX from 'xlsx';
 import Database from 'better-sqlite3';
 import { Server } from 'socket.io';
@@ -352,7 +351,7 @@ const saveUser = user => {
 
 
 /* =========================
-   AUTH / RESEND
+   AUTH / BREVO
 ========================= */
 
 const pendingCodes = new Map();
@@ -383,16 +382,25 @@ const deviceRegistry = new Map(
 );
 
 /*
-  Resend email service.
+  Brevo email service.
 
   IMPORTANT:
-  RESEND_API_KEY must be configured
-  in Render Environment Variables.
+  Add these in Render Environment Variables:
+
+  BREVO_API_KEY
+  BREVO_SENDER_EMAIL
+  BREVO_SENDER_NAME
 */
 
-const resend = process.env.RESEND_API_KEY
-  ? new Resend(process.env.RESEND_API_KEY)
-  : null;
+const brevoApiKey =
+  process.env.BREVO_API_KEY || '';
+
+const brevoSenderEmail =
+  process.env.BREVO_SENDER_EMAIL || '';
+
+const brevoSenderName =
+  process.env.BREVO_SENDER_NAME || 'NAVIGO';
+
 
 const publicUser = user => ({
   id: user.id,
@@ -525,6 +533,7 @@ async function routeToLocation(
     'https://routes.googleapis.com/directions/v2:computeRoutes',
     {
       method: 'POST',
+
       headers: {
         'Content-Type':
           'application/json',
@@ -772,18 +781,21 @@ app.post(
         });
     }
 
-    /* Check Resend configuration */
+    /* Check Brevo configuration */
 
-    if (!resend) {
+    if (
+      !brevoApiKey ||
+      !brevoSenderEmail
+    ) {
       console.error(
-        'RESEND_API_KEY is missing.'
+        'BREVO_API_KEY or BREVO_SENDER_EMAIL is missing.'
       );
 
       return res
         .status(503)
         .json({
           message:
-            'Email verification is not configured. Add RESEND_API_KEY in Render Environment Variables.'
+            'Email verification is not configured.'
         });
     }
 
@@ -832,59 +844,79 @@ app.post(
         `Attempting to send verification email to ${email}`
       );
 
-      const {
-        data,
-        error
-      } =
-        await resend.emails.send(
+      const brevoResponse =
+        await fetch(
+          'https://api.brevo.com/v3/smtp/email',
           {
-            from:
-              'NAVIGO <onboarding@resend.dev>',
+            method: 'POST',
 
-            to: [email],
+            headers: {
+              accept:
+                'application/json',
 
-            subject:
-              'Your NAVIGO verification code',
+              'api-key':
+                brevoApiKey,
 
-            text:
-              `Your NAVIGO verification code is ${code}. It expires in 10 minutes.`,
+              'content-type':
+                'application/json'
+            },
 
-            html: `
-              <div style="font-family: Arial, sans-serif; line-height: 1.6;">
-                <h2>NAVIGO Email Verification</h2>
+            body: JSON.stringify({
+              sender: {
+                email:
+                  brevoSenderEmail,
 
-                <p>Your NAVIGO verification code is:</p>
+                name:
+                  brevoSenderName
+              },
 
-                <h1 style="letter-spacing: 5px;">
-                  ${code}
-                </h1>
+              to: [
+                {
+                  email
+                }
+              ],
 
-                <p>
-                  This code expires in 10 minutes.
-                </p>
+              subject:
+                'Your NAVIGO verification code',
 
-                <p>
-                  If you did not request this code,
-                  you can safely ignore this email.
-                </p>
-              </div>
-            `
+              htmlContent: `
+                <div style="font-family: Arial, sans-serif; line-height: 1.6;">
+                  <h2>NAVIGO Email Verification</h2>
+
+                  <p>Your NAVIGO verification code is:</p>
+
+                  <h1 style="letter-spacing: 5px;">
+                    ${code}
+                  </h1>
+
+                  <p>
+                    This code expires in 10 minutes.
+                  </p>
+
+                  <p>
+                    If you did not request this code,
+                    you can safely ignore this email.
+                  </p>
+                </div>
+              `
+            })
           }
         );
 
-      /*
-        Resend can return an error without
-        throwing an exception, so check it.
-      */
+      const brevoResult =
+        await brevoResponse
+          .json()
+          .catch(() => ({}));
 
-      if (error) {
+      if (!brevoResponse.ok) {
         console.error(
-          'RESEND EMAIL ERROR:',
-          JSON.stringify(
-            error,
-            null,
-            2
-          )
+          'BREVO EMAIL ERROR:',
+          {
+            statusCode:
+              brevoResponse.status,
+
+            ...brevoResult
+          }
         );
 
         pendingCodes.delete(
@@ -897,16 +929,13 @@ app.post(
             message:
               'We could not send the verification email.',
             provider:
-              'Resend',
-            error:
-              error.message ||
-              String(error)
+              'Brevo'
           });
       }
 
       console.log(
         'Verification email sent successfully:',
-        data
+        brevoResult
       );
 
       return res
@@ -924,7 +953,7 @@ app.post(
       );
 
       console.error(
-        'RESEND SEND FAILED:',
+        'BREVO SEND FAILED:',
         error
       );
 
@@ -933,8 +962,10 @@ app.post(
         .json({
           message:
             'We could not send the verification email.',
+
           provider:
-            'Resend',
+            'Brevo',
+
           error:
             error?.message ||
             String(error)
@@ -1400,8 +1431,10 @@ app.post(
       .status(202)
       .json({
         accepted: true,
+
         busId:
           device.busId,
+
         receivedAt:
           Date.now()
       });
