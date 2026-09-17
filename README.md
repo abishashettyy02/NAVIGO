@@ -1,5 +1,4 @@
 # NAVIGO
-
 NAVIGO is a real-time bus location demo for Mangaluru. Drivers share browser GPS data, passengers receive position updates over Socket.IO, and Google Maps renders the live map and driving route.
 
 ## Required services
