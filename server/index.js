@@ -22,9 +22,12 @@ const projectRoot = path.resolve(
   '..'
 );
 
-const clientOrigin = process.env.CLIENT_ORIGIN || true;
+const clientOrigin =
+  process.env.CLIENT_ORIGIN || true;
+
 const secret =
-  process.env.JWT_SECRET || 'development-only-change-me';
+  process.env.JWT_SECRET ||
+  'development-only-change-me';
 
 const deviceApiKey =
   process.env.DEVICE_API_KEY || '';
@@ -154,16 +157,18 @@ function loadWorkbook() {
   try {
     const book = XLSX.readFile(workbookPath);
 
-    const timetableSheet = book.Sheets.Sheet2;
+    const timetableSheet =
+      book.Sheets.Sheet2;
 
     if (!timetableSheet) {
       throw new Error('Sheet2 is missing');
     }
 
-    const rows = XLSX.utils.sheet_to_json(
-      timetableSheet,
-      { defval: '' }
-    );
+    const rows =
+      XLSX.utils.sheet_to_json(
+        timetableSheet,
+        { defval: '' }
+      );
 
     const headers =
       XLSX.utils
@@ -186,7 +191,9 @@ function loadWorkbook() {
         known.get(slug(name)) || {
           id: slug(name),
           name: String(name).trim(),
-          lat: 12.86 + (index % 7) * 0.008,
+          lat:
+            12.86 +
+            (index % 7) * 0.008,
           lng:
             74.81 +
             Math.floor(index / 7) * 0.008
@@ -239,6 +246,7 @@ function loadWorkbook() {
           row['Bus ID'] ||
             `BUS-${index + 1}`
         ),
+
         routeId:
           routes.find(
             route =>
@@ -247,24 +255,31 @@ function loadWorkbook() {
                 row['BUS NO.'] || ''
               ).trim()
           )?.id || 'route',
+
         operator: String(
           row.BUS || ''
         ).trim(),
+
         occupancy:
           'Tracking unavailable',
+
         lat: 12.87,
         lng: 74.84,
+
         updatedAt: null
       })
     );
 
     return {
       stops,
+
       routes:
         routes.length
           ? routes
           : fallbackRoutes,
+
       buses,
+
       rows
     };
   } catch (error) {
@@ -300,7 +315,8 @@ fs.mkdirSync(
   { recursive: true }
 );
 
-const usersDb = new Database(usersDbPath);
+const usersDb =
+  new Database(usersDbPath);
 
 usersDb.pragma('journal_mode = WAL');
 
@@ -518,6 +534,7 @@ function findOptions(
             {
               type: 'direct',
               route,
+
               bus: [
                 ...buses.values()
               ].find(
@@ -525,6 +542,7 @@ function findOptions(
                   bus.routeId ===
                   route.id
               ),
+
               durationMin:
                 (end - start) * 7
             }
@@ -559,12 +577,13 @@ function activeBuses() {
   live bus position to a passenger position.
 
   Google Routes API:
+
   - DRIVE
   - TRAFFIC_AWARE
 
   duration is returned by Google in
-  seconds and is then converted into
-  minutes by /api/arrivals.
+  seconds and is converted into minutes
+  by /api/arrivals.
 */
 
 async function routeToLocation(
@@ -654,6 +673,7 @@ async function routeToLocation(
           current traffic conditions.
         */
         travelMode: 'DRIVE',
+
         routingPreference:
           'TRAFFIC_AWARE'
       })
@@ -717,6 +737,7 @@ async function routeToLocation(
 
   return {
     durationSeconds,
+
     distanceMeters:
       Number.isFinite(
         distanceMeters
@@ -786,8 +807,10 @@ app.get(
         process.env
           .GOOGLE_MAPS_API_KEY ||
         '',
+
       routeCount:
         transit.routes.length,
+
       tripCount:
         transit.rows.length
     })
@@ -992,6 +1015,7 @@ app.post(
                 sender: {
                   email:
                     brevoSenderEmail,
+
                   name:
                     brevoSenderName
                 },
@@ -1193,6 +1217,7 @@ app.post(
       .json({
         token:
           tokenFor(user),
+
         user:
           publicUser(user)
       });
@@ -1248,6 +1273,7 @@ app.post(
     res.json({
       token:
         tokenFor(user),
+
       user:
         publicUser(user)
     });
@@ -1292,6 +1318,7 @@ app.post(
 
     res.json({
       from: origin,
+
       to: destination,
 
       options:
@@ -1352,7 +1379,9 @@ app.post(
       activeBuses();
 
     /*
-      Calculate ETA for every live bus.
+      Calculate ETA and road distance for
+      every live bus.
+
       Promise.allSettled means one failed
       Google route does not break all buses.
     */
@@ -1366,6 +1395,10 @@ app.post(
                 location
               );
 
+            /*
+              Calculate ETA from Google's
+              traffic-aware duration.
+            */
             const etaMinutes =
               route &&
               Number.isFinite(
@@ -1380,16 +1413,41 @@ app.post(
                   )
                 : null;
 
-            const distanceKm =
+            /*
+              Keep the exact road distance
+              in meters.
+
+              DO NOT round this before
+              checking the arrival threshold.
+            */
+            const distanceMeters =
               route &&
               Number.isFinite(
                 route.distanceMeters
               )
+                ? route.distanceMeters
+                : null;
+
+            /*
+              Bus is considered ARRIVED when
+              it is 5 meters or less from
+              the passenger.
+            */
+            const hasArrived =
+              distanceMeters !== null &&
+              distanceMeters <= 5;
+
+            /*
+              Distance in kilometers is still
+              returned for the existing frontend.
+            */
+            const distanceKm =
+              distanceMeters !== null
                 ? Number(
                     (
-                      route.distanceMeters /
+                      distanceMeters /
                       1000
-                    ).toFixed(1)
+                    ).toFixed(3)
                   )
                 : null;
 
@@ -1402,14 +1460,24 @@ app.post(
               etaMinutes,
 
               /*
-                Road distance between
-                bus and passenger.
+                Exact Google road distance.
+              */
+              distanceMeters,
+
+              /*
+                Road distance in kilometers.
               */
               distanceKm,
 
               /*
-                Route information used
-                by the frontend map.
+                TRUE when the bus is within
+                5 meters of the passenger.
+              */
+              hasArrived,
+
+              /*
+                Route information used by
+                the frontend map.
               */
               roadRoute:
                 route
@@ -1438,14 +1506,20 @@ app.post(
           );
 
           /*
-            Keep the bus visible even
-            when Google cannot calculate
-            its ETA.
+            Keep the bus visible even when
+            Google cannot calculate its ETA.
           */
           return {
             ...bus,
+
             etaMinutes: null,
+
+            distanceMeters: null,
+
             distanceKm: null,
+
+            hasArrived: false,
+
             roadRoute: null
           };
         }
@@ -1453,8 +1527,8 @@ app.post(
 
     /*
       Sort buses by ETA.
-      Buses without an ETA go to
-      the bottom.
+
+      Buses without an ETA go to the bottom.
     */
     arrivals.sort(
       (a, b) =>
@@ -1570,8 +1644,11 @@ app.post(
         existing.routeId ||
         'route',
 
-      lat: latitude,
-      lng: longitude,
+      lat:
+        latitude,
+
+      lng:
+        longitude,
 
       occupancy,
 
@@ -1666,8 +1743,11 @@ app.post(
         existing.routeId ||
         'route',
 
-      lat: latitude,
-      lng: longitude,
+      lat:
+        latitude,
+
+      lng:
+        longitude,
 
       occupancy,
 
