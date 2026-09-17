@@ -23,8 +23,11 @@ const projectRoot = path.resolve(
 );
 
 const clientOrigin = process.env.CLIENT_ORIGIN || true;
-const secret = process.env.JWT_SECRET || 'development-only-change-me';
-const deviceApiKey = process.env.DEVICE_API_KEY || '';
+const secret =
+  process.env.JWT_SECRET || 'development-only-change-me';
+
+const deviceApiKey =
+  process.env.DEVICE_API_KEY || '';
 
 let configuredDevices = [];
 
@@ -33,16 +36,19 @@ try {
     process.env.DEVICE_REGISTRY_JSON || '[]'
   );
 } catch {
-  console.warn('DEVICE_REGISTRY_JSON is not valid JSON.');
+  console.warn(
+    'DEVICE_REGISTRY_JSON is not valid JSON.'
+  );
 }
 
 const io = new Server(server, {
-  cors: { origin: clientOrigin }
+  cors: {
+    origin: clientOrigin
+  }
 });
 
 app.use(cors({ origin: clientOrigin }));
 app.use(express.json({ limit: '20kb' }));
-
 
 /* =========================
    FALLBACK DATA
@@ -133,8 +139,8 @@ const slug = value =>
     .replace(/(^-|-$)/g, '');
 
 const numberFrom = value =>
-  String(value || '').match(/^\s*([^\s-]+)/)?.[1] || 'route';
-
+  String(value || '').match(/^\s*(\S+)/)?.[1] ||
+  'route';
 
 /* =========================
    WORKBOOK
@@ -161,7 +167,10 @@ function loadWorkbook() {
 
     const headers =
       XLSX.utils
-        .sheet_to_json(timetableSheet, { header: 1 })[0]
+        .sheet_to_json(
+          timetableSheet,
+          { header: 1 }
+        )[0]
         .slice(2)
         .filter(Boolean);
 
@@ -185,7 +194,11 @@ function loadWorkbook() {
     );
 
     for (const stop of fallbackStops) {
-      if (!stops.some(item => item.id === stop.id)) {
+      if (
+        !stops.some(
+          item => item.id === stop.id
+        )
+      ) {
         stops.push(stop);
       }
     }
@@ -193,7 +206,9 @@ function loadWorkbook() {
     const byName = new Map();
 
     for (const row of rows) {
-      const name = String(row.Route || '').trim();
+      const name = String(
+        row.Route || ''
+      ).trim();
 
       if (!name || byName.has(name)) {
         continue;
@@ -212,37 +227,46 @@ function loadWorkbook() {
 
     const routes = [...byName.values()];
 
-    const inventory = XLSX.utils.sheet_to_json(
-      book.Sheets.Sheet3,
-      { defval: '' }
-    );
+    const inventory =
+      XLSX.utils.sheet_to_json(
+        book.Sheets.Sheet3,
+        { defval: '' }
+      );
 
-    const buses = inventory.map((row, index) => ({
-      id: String(
-        row['Bus ID'] || `BUS-${index + 1}`
-      ),
-      routeId:
-        routes.find(
-          route =>
-            route.number ===
-            String(row['BUS NO.'] || '').trim()
-        )?.id || 'route',
-      operator: String(row.BUS || '').trim(),
-      occupancy: 'Tracking unavailable',
-      lat: 12.87,
-      lng: 74.84,
-      updatedAt: null
-    }));
+    const buses = inventory.map(
+      (row, index) => ({
+        id: String(
+          row['Bus ID'] ||
+            `BUS-${index + 1}`
+        ),
+        routeId:
+          routes.find(
+            route =>
+              route.number ===
+              String(
+                row['BUS NO.'] || ''
+              ).trim()
+          )?.id || 'route',
+        operator: String(
+          row.BUS || ''
+        ).trim(),
+        occupancy:
+          'Tracking unavailable',
+        lat: 12.87,
+        lng: 74.84,
+        updatedAt: null
+      })
+    );
 
     return {
       stops,
-      routes: routes.length
-        ? routes
-        : fallbackRoutes,
+      routes:
+        routes.length
+          ? routes
+          : fallbackRoutes,
       buses,
       rows
     };
-
   } catch (error) {
     console.warn(
       `Workbook not loaded: ${error.message}`
@@ -258,7 +282,6 @@ function loadWorkbook() {
 }
 
 const transit = loadWorkbook();
-
 
 /* =========================
    DATABASE
@@ -332,7 +355,8 @@ const rowToUser = row =>
     password: row.password_hash,
     role: row.role,
     busId: row.bus_id,
-    sessionVersion: row.session_version
+    sessionVersion:
+      row.session_version
   };
 
 const getUserByEmail = email =>
@@ -348,7 +372,6 @@ const saveUser = user => {
 
   return user;
 };
-
 
 /* =========================
    AUTH / BREVO
@@ -384,8 +407,7 @@ const deviceRegistry = new Map(
 /*
   Brevo email service.
 
-  IMPORTANT:
-  Add these in Render Environment Variables:
+  Render Environment Variables:
 
   BREVO_API_KEY
   BREVO_SENDER_EMAIL
@@ -399,8 +421,8 @@ const brevoSenderEmail =
   process.env.BREVO_SENDER_EMAIL || '';
 
 const brevoSenderName =
-  process.env.BREVO_SENDER_NAME || 'NAVIGO';
-
+  process.env.BREVO_SENDER_NAME ||
+  'NAVIGO';
 
 const publicUser = user => ({
   id: user.id,
@@ -413,7 +435,8 @@ const tokenFor = user =>
   jwt.sign(
     {
       ...publicUser(user),
-      sessionVersion: user.sessionVersion
+      sessionVersion:
+        user.sessionVersion
     },
     secret,
     {
@@ -421,11 +444,19 @@ const tokenFor = user =>
     }
   );
 
-const auth = roles => (req, res, next) => {
+const auth = roles => (
+  req,
+  res,
+  next
+) => {
   try {
     const user = jwt.verify(
-      (req.headers.authorization || '')
-        .replace('Bearer ', ''),
+      (
+        req.headers.authorization || ''
+      ).replace(
+        'Bearer ',
+        ''
+      ),
       secret
     );
 
@@ -455,47 +486,52 @@ const auth = roles => (req, res, next) => {
 
     req.user = user;
     next();
-
   } catch {
     res
       .status(401)
       .json({
-        message: 'Sign in required'
+        message:
+          'Sign in required'
       });
   }
 };
-
 
 /* =========================
    ROUTING
 ========================= */
 
-function findOptions(from, to) {
-  return transit.routes.flatMap(route => {
-    const start =
-      route.stops.indexOf(from);
+function findOptions(
+  from,
+  to
+) {
+  return transit.routes.flatMap(
+    route => {
+      const start =
+        route.stops.indexOf(from);
 
-    const end =
-      route.stops.indexOf(to);
+      const end =
+        route.stops.indexOf(to);
 
-    return start >= 0 && end > start
-      ? [
-          {
-            type: 'direct',
-            route,
-            bus: [
-              ...buses.values()
-            ].find(
-              bus =>
-                bus.routeId ===
-                route.id
-            ),
-            durationMin:
-              (end - start) * 7
-          }
-        ]
-      : [];
-  });
+      return start >= 0 &&
+        end > start
+        ? [
+            {
+              type: 'direct',
+              route,
+              bus: [
+                ...buses.values()
+              ].find(
+                bus =>
+                  bus.routeId ===
+                  route.id
+              ),
+              durationMin:
+                (end - start) * 7
+            }
+          ]
+        : [];
+    }
+  );
 }
 
 function activeBuses() {
@@ -513,10 +549,23 @@ function activeBuses() {
   );
 }
 
-
 /* =========================
-   GOOGLE ROUTES
+   GOOGLE ROUTES / ETA
 ========================= */
+
+/*
+  Calculates the real road distance and
+  traffic-aware travel duration from a
+  live bus position to a passenger position.
+
+  Google Routes API:
+  - DRIVE
+  - TRAFFIC_AWARE
+
+  duration is returned by Google in
+  seconds and is then converted into
+  minutes by /api/arrivals.
+*/
 
 async function routeToLocation(
   origin,
@@ -526,6 +575,35 @@ async function routeToLocation(
     process.env.GOOGLE_ROUTES_API_KEY;
 
   if (!apiKey) {
+    console.warn(
+      'GOOGLE_ROUTES_API_KEY is not configured.'
+    );
+
+    return null;
+  }
+
+  const originLat =
+    Number(origin?.lat);
+
+  const originLng =
+    Number(origin?.lng);
+
+  const destinationLat =
+    Number(destination?.lat);
+
+  const destinationLng =
+    Number(destination?.lng);
+
+  if (
+    !Number.isFinite(originLat) ||
+    !Number.isFinite(originLng) ||
+    !Number.isFinite(destinationLat) ||
+    !Number.isFinite(destinationLng)
+  ) {
+    console.warn(
+      'Invalid coordinates supplied to Google Routes.'
+    );
+
     return null;
   }
 
@@ -541,6 +619,10 @@ async function routeToLocation(
         'X-Goog-Api-Key':
           apiKey,
 
+        /*
+          Request only the fields needed
+          for ETA, distance and map route.
+        */
         'X-Goog-FieldMask':
           'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline'
       },
@@ -549,8 +631,8 @@ async function routeToLocation(
         origin: {
           location: {
             latLng: {
-              latitude: origin.lat,
-              longitude: origin.lng
+              latitude: originLat,
+              longitude: originLng
             }
           }
         },
@@ -558,14 +640,20 @@ async function routeToLocation(
         destination: {
           location: {
             latLng: {
-              latitude: destination.lat,
-              longitude: destination.lng
+              latitude: destinationLat,
+              longitude: destinationLng
             }
           }
         },
 
-        travelMode: 'DRIVE',
+        /*
+          DRIVE allows road-based routing.
 
+          TRAFFIC_AWARE makes Google's
+          returned duration account for
+          current traffic conditions.
+        */
+        travelMode: 'DRIVE',
         routingPreference:
           'TRAFFIC_AWARE'
       })
@@ -573,35 +661,75 @@ async function routeToLocation(
   );
 
   if (!response.ok) {
+    const errorText =
+      await response.text().catch(
+        () => ''
+      );
+
     throw new Error(
-      `Google Routes API returned ${response.status}`
+      `Google Routes API returned ${response.status}${
+        errorText
+          ? `: ${errorText.slice(0, 300)}`
+          : ''
+      }`
     );
   }
 
+  const data =
+    await response.json();
+
   const route =
-    (
-      await response.json()
-    ).routes?.[0];
+    data.routes?.[0];
 
-  return route
-    ? {
-        durationSeconds:
-          Number.parseInt(
-            route.duration,
-            10
-          ),
+  if (!route) {
+    return null;
+  }
 
-        distanceMeters:
-          route.distanceMeters,
+  /*
+    Google returns duration in a string
+    such as "123s".
+  */
+  const durationMatch =
+    String(
+      route.duration || ''
+    ).match(/^([\d.]+)s$/);
 
-        encodedPolyline:
-          route.polyline
-            ?.encodedPolyline ||
-          null
-      }
-    : null;
+  const durationSeconds =
+    durationMatch
+      ? Number(durationMatch[1])
+      : Number.NaN;
+
+  const distanceMeters =
+    Number(route.distanceMeters);
+
+  if (
+    !Number.isFinite(
+      durationSeconds
+    ) ||
+    durationSeconds < 0
+  ) {
+    console.warn(
+      'Google returned an invalid route duration.'
+    );
+
+    return null;
+  }
+
+  return {
+    durationSeconds,
+    distanceMeters:
+      Number.isFinite(
+        distanceMeters
+      )
+        ? distanceMeters
+        : null,
+
+    encodedPolyline:
+      route.polyline
+        ?.encodedPolyline ||
+      null
+  };
 }
-
 
 /* =========================
    DEVICE AUTH
@@ -636,7 +764,6 @@ function assertDevice(
   next();
 }
 
-
 /* =========================
    BASIC API
 ========================= */
@@ -656,7 +783,8 @@ app.get(
   (req, res) =>
     res.json({
       googleMapsKey:
-        process.env.GOOGLE_MAPS_API_KEY ||
+        process.env
+          .GOOGLE_MAPS_API_KEY ||
         '',
       routeCount:
         transit.routes.length,
@@ -708,12 +836,12 @@ app.get(
       buses.get(req.user.busId) || {
         id: req.user.busId,
         routeId: 'route',
-        occupancy: 'Not reported',
+        occupancy:
+          'Not reported',
         updatedAt: null
       }
     )
 );
-
 
 /* =========================
    REQUEST OTP
@@ -780,8 +908,6 @@ app.post(
             'Please wait a minute before requesting another code.'
         });
     }
-
-    /* Check Brevo configuration */
 
     if (
       !brevoApiKey ||
@@ -861,45 +987,45 @@ app.post(
                 'application/json'
             },
 
-            body: JSON.stringify({
-              sender: {
-                email:
-                  brevoSenderEmail,
+            body:
+              JSON.stringify({
+                sender: {
+                  email:
+                    brevoSenderEmail,
+                  name:
+                    brevoSenderName
+                },
 
-                name:
-                  brevoSenderName
-              },
+                to: [
+                  {
+                    email
+                  }
+                ],
 
-              to: [
-                {
-                  email
-                }
-              ],
+                subject:
+                  'Your NAVIGO verification code',
 
-              subject:
-                'Your NAVIGO verification code',
+                htmlContent: `
+                  <div style="font-family: Arial, sans-serif; line-height: 1.6;">
+                    <h2>NAVIGO Email Verification</h2>
 
-              htmlContent: `
-                <div style="font-family: Arial, sans-serif; line-height: 1.6;">
-                  <h2>NAVIGO Email Verification</h2>
+                    <p>Your NAVIGO verification code is:</p>
 
-                  <p>Your NAVIGO verification code is:</p>
+                    <h1 style="letter-spacing: 5px;">
+                      ${code}
+                    </h1>
 
-                  <h1 style="letter-spacing: 5px;">
-                    ${code}
-                  </h1>
+                    <p>
+                      This code expires in 10 minutes.
+                    </p>
 
-                  <p>
-                    This code expires in 10 minutes.
-                  </p>
-
-                  <p>
-                    If you did not request this code,
-                    you can safely ignore this email.
-                  </p>
-                </div>
-              `
-            })
+                    <p>
+                      If you did not request this code,
+                      you can safely ignore this email.
+                    </p>
+                  </div>
+                `
+              })
           }
         );
 
@@ -914,7 +1040,6 @@ app.post(
           {
             statusCode:
               brevoResponse.status,
-
             ...brevoResult
           }
         );
@@ -946,7 +1071,6 @@ app.post(
               ? 'Verification code sent. Verifying it will replace your old password and sign out previous sessions.'
               : 'Verification code sent.'
         });
-
     } catch (error) {
       pendingCodes.delete(
         email
@@ -962,10 +1086,8 @@ app.post(
         .json({
           message:
             'We could not send the verification email.',
-
           provider:
             'Brevo',
-
           error:
             error?.message ||
             String(error)
@@ -973,7 +1095,6 @@ app.post(
     }
   }
 );
-
 
 /* =========================
    VERIFY OTP
@@ -1025,7 +1146,9 @@ app.post(
     }
 
     if (
-      String(req.body.code).trim() !==
+      String(
+        req.body.code
+      ).trim() !==
       pending.code
     ) {
       return res
@@ -1070,13 +1193,11 @@ app.post(
       .json({
         token:
           tokenFor(user),
-
         user:
           publicUser(user)
       });
   }
 );
-
 
 /* =========================
    LOGIN
@@ -1127,13 +1248,11 @@ app.post(
     res.json({
       token:
         tokenFor(user),
-
       user:
         publicUser(user)
     });
   }
 );
-
 
 /* =========================
    JOURNEY SEARCH
@@ -1173,7 +1292,6 @@ app.post(
 
     res.json({
       from: origin,
-
       to: destination,
 
       options:
@@ -1190,19 +1308,22 @@ app.post(
   }
 );
 
-
 /* =========================
-   ARRIVALS
+   ARRIVALS / LIVE ETA
 ========================= */
 
 app.post(
   '/api/arrivals',
   auth(['passenger']),
   async (req, res) => {
-    const {
-      lat,
-      lng
-    } = req.body;
+    /*
+      Passenger's current GPS position.
+    */
+    const lat =
+      Number(req.body.lat);
+
+    const lng =
+      Number(req.body.lng);
 
     if (
       !Number.isFinite(lat) ||
@@ -1223,90 +1344,142 @@ app.post(
       lng
     };
 
+    /*
+      Only buses with a recent GPS update
+      are considered live.
+    */
     const live =
       activeBuses();
 
-    try {
-      const arrivals =
-        await Promise.all(
-          live.map(
-            async bus => {
-              const route =
-                await routeToLocation(
-                  bus,
-                  location
-                );
+    /*
+      Calculate ETA for every live bus.
+      Promise.allSettled means one failed
+      Google route does not break all buses.
+    */
+    const results =
+      await Promise.allSettled(
+        live.map(
+          async bus => {
+            const route =
+              await routeToLocation(
+                bus,
+                location
+              );
 
-              return {
-                ...bus,
+            const etaMinutes =
+              route &&
+              Number.isFinite(
+                route.durationSeconds
+              )
+                ? Math.max(
+                    1,
+                    Math.ceil(
+                      route.durationSeconds /
+                        60
+                    )
+                  )
+                : null;
 
-                etaMinutes:
-                  route
-                    ? Math.max(
-                        1,
-                        Math.ceil(
-                          route.durationSeconds /
-                            60
-                        )
-                      )
-                    : null,
+            const distanceKm =
+              route &&
+              Number.isFinite(
+                route.distanceMeters
+              )
+                ? Number(
+                    (
+                      route.distanceMeters /
+                      1000
+                    ).toFixed(1)
+                  )
+                : null;
 
-                distanceKm:
-                  route
-                    ? Number(
-                        (
-                          route.distanceMeters /
-                          1000
-                        ).toFixed(1)
-                      )
-                    : null,
+            return {
+              ...bus,
 
-                roadRoute:
-                  route
-              };
-            }
-          )
-        );
+              /*
+                Final passenger-facing ETA.
+              */
+              etaMinutes,
 
-      arrivals.sort(
-        (a, b) =>
-          (a.etaMinutes ??
-            Infinity) -
-          (b.etaMinutes ??
-            Infinity)
+              /*
+                Road distance between
+                bus and passenger.
+              */
+              distanceKm,
+
+              /*
+                Route information used
+                by the frontend map.
+              */
+              roadRoute:
+                route
+            };
+          }
+        )
       );
 
-      res.json({
-        location,
+    const arrivals =
+      results.map(
+        (result, index) => {
+          if (
+            result.status ===
+            'fulfilled'
+          ) {
+            return result.value;
+          }
 
-        arrivals,
+          const bus =
+            live[index];
 
-        provider:
-          process.env
-            .GOOGLE_ROUTES_API_KEY
-            ? 'Google Routes API'
-            : 'unavailable',
+          console.error(
+            `ETA calculation failed for bus ${bus?.id}:`,
+            result.reason?.message ||
+              result.reason
+          );
 
-        updatedAt:
-          Date.now()
-      });
-
-    } catch (error) {
-      console.error(
-        'Arrival calculation failed:',
-        error.message
+          /*
+            Keep the bus visible even
+            when Google cannot calculate
+            its ETA.
+          */
+          return {
+            ...bus,
+            etaMinutes: null,
+            distanceKm: null,
+            roadRoute: null
+          };
+        }
       );
 
-      res
-        .status(502)
-        .json({
-          message:
-            'Live arrival estimates are temporarily unavailable.'
-        });
-    }
+    /*
+      Sort buses by ETA.
+      Buses without an ETA go to
+      the bottom.
+    */
+    arrivals.sort(
+      (a, b) =>
+        (a.etaMinutes ??
+          Infinity) -
+        (b.etaMinutes ??
+          Infinity)
+    );
+
+    res.json({
+      location,
+
+      arrivals,
+
+      provider:
+        process.env
+          .GOOGLE_ROUTES_API_KEY
+          ? 'Google Routes API'
+          : 'unavailable',
+
+      updatedAt:
+        Date.now()
+    });
   }
 );
-
 
 /* =========================
    HARDWARE GPS
@@ -1353,11 +1526,17 @@ app.post(
         });
     }
 
+    const latitude =
+      Number(lat);
+
+    const longitude =
+      Number(lng);
+
     if (
-      !Number.isFinite(lat) ||
-      !Number.isFinite(lng) ||
-      Math.abs(lat) > 90 ||
-      Math.abs(lng) > 180
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude) ||
+      Math.abs(latitude) > 90 ||
+      Math.abs(longitude) > 180
     ) {
       return res
         .status(400)
@@ -1372,6 +1551,13 @@ app.post(
         device.busId
       ) || {};
 
+    const parsedSentAt =
+      sentAt
+        ? new Date(
+            sentAt
+          ).getTime()
+        : Date.now();
+
     const position = {
       ...existing,
 
@@ -1384,38 +1570,28 @@ app.post(
         existing.routeId ||
         'route',
 
-      lat,
-
-      lng,
+      lat: latitude,
+      lng: longitude,
 
       occupancy,
 
       accuracy:
         Number.isFinite(
-          accuracy
+          Number(accuracy)
         )
-          ? accuracy
+          ? Number(accuracy)
           : null,
 
       updatedAt:
-        sentAt
-          ? new Date(
-              sentAt
-            ).getTime()
+        Number.isFinite(
+          parsedSentAt
+        )
+          ? parsedSentAt
           : Date.now(),
 
       source:
         'hardware'
     };
-
-    if (
-      !Number.isFinite(
-        position.updatedAt
-      )
-    ) {
-      position.updatedAt =
-        Date.now();
-    }
 
     buses.set(
       device.busId,
@@ -1441,7 +1617,6 @@ app.post(
   }
 );
 
-
 /* =========================
    DRIVER LOCATION
 ========================= */
@@ -1456,14 +1631,22 @@ app.post(
       occupancy = 'Moderate'
     } = req.body;
 
+    const latitude =
+      Number(lat);
+
+    const longitude =
+      Number(lng);
+
     const existing =
       buses.get(
         req.user.busId
       ) || {};
 
     if (
-      !Number.isFinite(lat) ||
-      !Number.isFinite(lng)
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude) ||
+      Math.abs(latitude) > 90 ||
+      Math.abs(longitude) > 180
     ) {
       return res
         .status(400)
@@ -1483,9 +1666,8 @@ app.post(
         existing.routeId ||
         'route',
 
-      lat,
-
-      lng,
+      lat: latitude,
+      lng: longitude,
 
       occupancy,
 
@@ -1512,7 +1694,6 @@ app.post(
   }
 );
 
-
 /* =========================
    SOCKET.IO
 ========================= */
@@ -1525,7 +1706,6 @@ io.on(
       [...buses.values()]
     )
 );
-
 
 /* =========================
    PRODUCTION FRONTEND
@@ -1556,7 +1736,6 @@ if (
       )
   );
 }
-
 
 /* =========================
    START SERVER
