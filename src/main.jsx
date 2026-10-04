@@ -4,18 +4,24 @@ import { io } from 'socket.io-client';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || '/api';
-const fresh = bus => bus.updatedAt && Date.now() - bus.updatedAt < 300000;
+// A bus counts as live only with a recent update AND a usable GPS position (never a made-up one).
+const fresh = bus => bus.updatedAt && Number.isFinite(bus.lat) && Number.isFinite(bus.lng) && Date.now() - bus.updatedAt < 300000;
 const HARDWARE_STALE_MS = 60000; // no update from the bus GPS device in the last minute counts as offline
 
 function loadMaps(key) { if (window.google?.maps) return Promise.resolve(window.google.maps); if (window.navigoMapsPromise) return window.navigoMapsPromise; window.navigoMapsPromise = new Promise((resolve, reject) => { const s = document.createElement('script'); s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&libraries=geometry&loading=async`; s.async = true; s.onload = () => resolve(window.google.maps); s.onerror = reject; document.head.append(s); }); return window.navigoMapsPromise; }
 function LiveMap({ buses, customer, routePolyline, routeColor, stops, onBusClick }) {
-  const host = useRef(null), map = useRef(null), markers = useRef(new Map()), stopMarkers = useRef(new Map()), line = useRef(null), clickRef = useRef(onBusClick); const [key, setKey] = useState(null);
+  const host = useRef(null), map = useRef(null), markers = useRef(new Map()), stopMarkers = useRef(new Map()), line = useRef(null), clickRef = useRef(onBusClick), centered = useRef(false), fitted = useRef(''); const [key, setKey] = useState(null);
   clickRef.current = onBusClick;
   useEffect(() => { fetch(`${API}/public/config`).then(r => r.json()).then(c => setKey(c.googleMapsKey || '')).catch(() => setKey('')); }, []);
   useEffect(() => { if (!key || !host.current) return; let dead = false; loadMaps(key).then(maps => { if (dead) return; const instance = map.current ||= new maps.Map(host.current, { center: customer || { lat: 12.9141, lng: 74.856 }, zoom: customer ? 14 : 12, mapTypeControl: false, streetViewControl: false, fullscreenControl: false }); const points = [...buses.filter(fresh).map(b => ({ ...b, label: 'BUS' })), ...(customer ? [{ id: 'customer', ...customer, label: 'YOU' }] : [])]; const ids = new Set(points.map(p => p.id)); for (const [id, marker] of markers.current) if (!ids.has(id)) { marker.setMap(null); markers.current.delete(id); } points.forEach(p => { let marker = markers.current.get(p.id); if (!marker) { marker = new maps.Marker({ map: instance, label: p.label, title: p.id, icon: p.id === 'customer' ? undefined : { path: maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: '#086ee8', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 } }); if (p.id !== 'customer') marker.addListener('click', () => clickRef.current?.(p.id)); markers.current.set(p.id, marker); } marker.setPosition({ lat: p.lat, lng: p.lng }); });
-    // Stop markers: boarding stop (light blue) and, once the journey starts, current + destination stops (dark blue).
-    const stopList = (stops || []).filter(s => Number.isFinite(s.lat) && Number.isFinite(s.lng)); const stopKeys = new Set(stopList.map(s => s.key)); for (const [id, marker] of stopMarkers.current) if (!stopKeys.has(id)) { marker.setMap(null); stopMarkers.current.delete(id); } stopList.forEach(s => { let marker = stopMarkers.current.get(s.key); if (!marker) { marker = new maps.Marker({ map: instance }); stopMarkers.current.set(s.key, marker); } marker.setPosition({ lat: s.lat, lng: s.lng }); marker.setTitle(s.title || ''); marker.setLabel({ text: s.label, color: '#fff', fontSize: '11px', fontWeight: '700' }); marker.setIcon({ path: maps.SymbolPath.CIRCLE, scale: 11, fillColor: s.color, fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 }); });
-    if (customer) instance.setCenter(customer); if (line.current) { line.current.setMap(null); line.current = null; } if (routePolyline && maps.geometry?.encoding) line.current = new maps.Polyline({ path: maps.geometry.encoding.decodePath(routePolyline), strokeColor: routeColor || '#086ee8', strokeOpacity: .85, strokeWeight: 5, map: instance }); }).catch(() => {}); return () => { dead = true; }; }, [key, buses, customer, routePolyline, routeColor, stops]);
+    // Stop markers: the pickup stop (light blue) and, once the journey starts, boarding + destination stops (dark blue).
+    const stopList = (stops || []).filter(s => Number.isFinite(s.lat) && Number.isFinite(s.lng)); const stopKeys = new Set(stopList.map(s => s.key)); for (const [id, marker] of stopMarkers.current) if (!stopKeys.has(id)) { marker.setMap(null); stopMarkers.current.delete(id); } stopList.forEach(s => { let marker = stopMarkers.current.get(s.key); if (!marker) { marker = new maps.Marker({ map: instance, zIndex: 5 }); stopMarkers.current.set(s.key, marker); } marker.setPosition({ lat: s.lat, lng: s.lng }); marker.setTitle(s.title || ''); marker.setLabel({ text: s.label, color: '#fff', fontSize: '11px', fontWeight: '700' }); marker.setIcon({ path: maps.SymbolPath.CIRCLE, scale: 11, fillColor: s.color, fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 }); });
+    // Centre on the passenger once, then leave panning to the user; frame passenger + stops whenever the highlighted stops change.
+    if (customer && !centered.current) { instance.setCenter(customer); centered.current = true; }
+    const fitKey = stopList.length ? stopList.map(s => `${s.key}:${s.lat},${s.lng}`).join('|') : '';
+    if (!fitKey) fitted.current = '';
+    else if (customer && fitKey !== fitted.current) { const bounds = new maps.LatLngBounds(); bounds.extend(customer); stopList.forEach(s => bounds.extend({ lat: s.lat, lng: s.lng })); instance.fitBounds(bounds, 70); fitted.current = fitKey; }
+    if (line.current) { line.current.setMap(null); line.current = null; } if (routePolyline && maps.geometry?.encoding) line.current = new maps.Polyline({ path: maps.geometry.encoding.decodePath(routePolyline), strokeColor: routeColor || '#086ee8', strokeOpacity: .85, strokeWeight: 5, map: instance }); }).catch(() => {}); return () => { dead = true; }; }, [key, buses, customer, routePolyline, routeColor, stops]);
   return <div ref={host} className="live-map">{key === '' && <div className="map-fallback">Add your Google Maps API key to show the live map.</div>}</div>;
 }
 function useBuses() { const [buses, setBuses] = useState([]); useEffect(() => { fetch(`${API}/buses`).then(r => r.json()).then(setBuses).catch(() => {}); const socket = io({ path: '/socket.io' }); socket.on('buses:initial', setBuses); socket.on('bus:position', bus => setBuses(current => [...current.filter(b => b.id !== bus.id), bus])); return () => socket.close(); }, []); return buses; }
@@ -90,15 +96,24 @@ function AuthV2({ done }) {
     </form>
   </main>;
 }
-// etaMinutes === 0 (or hasArrived) always reads "Arrived"; only a missing ETA reads "Calculating...".
-// Number.isFinite (not truthiness) keeps an ETA of 0 from being mistaken for "no ETA yet".
-const etaText = (etaMinutes, hasArrived) => hasArrived || etaMinutes === 0 ? 'Arrived' : Number.isFinite(etaMinutes) ? `${etaMinutes} min` : 'Calculating...';
+// etaMinutes === 0 (or hasArrived) always reads "Arrived". Number.isFinite (not truthiness) keeps an ETA of 0
+// from being mistaken for "no ETA". "Calculating..." is only the state before the server has answered at all
+// (status undefined); once it has answered, a missing ETA reads as a definite state, never an endless spinner.
+const etaText = (etaMinutes, hasArrived, status) => {
+  if (hasArrived || etaMinutes === 0 || status === 'arrived') return 'Arrived';
+  if (Number.isFinite(etaMinutes)) return `${etaMinutes} min`;
+  if (status === 'no-live-data') return 'No live bus data';
+  if (status === 'awaiting-destination') return 'Choose destination';
+  if (status === 'unavailable') return 'ETA unavailable';
+  return 'Calculating...';
+};
 function Arrival({ item, selected, select }) {
   const route = item.routeId?.split('-')[0]?.toUpperCase() || 'LIVE';
   const arrived = item.hasArrived || item.etaMinutes === 0;
-  const etaLabel = etaText(item.etaMinutes, item.hasArrived);
-  const distanceLabel = Number.isFinite(item.distanceKm) ? `${item.distanceKm} km` : 'Live';
-  return <button className={`arrival-card ${selected ? 'selected' : ''} ${arrived ? 'arrived' : ''}`} onClick={select}><div className="route-chip">{route}</div><div className="arrival-main"><strong>{etaLabel}</strong><span>{item.id} · {item.operator || 'Live bus'}{item.boardingStop ? ` · to ${item.boardingStop.name}` : ''}</span></div><div className="distance">{distanceLabel}<small>{item.source === 'hardware' ? 'GPS device' : 'Shared location'}</small></div></button>;
+  const etaLabel = etaText(item.etaMinutes, item.hasArrived, item.etaStatus);
+  const distanceLabel = arrived ? 'At stop' : Number.isFinite(item.distanceKm) ? `${item.distanceKm} km` : '—';
+  const target = item.targetStop || item.boardingStop;
+  return <button className={`arrival-card ${selected ? 'selected' : ''} ${arrived ? 'arrived' : ''}`} onClick={select}><div className="route-chip">{route}</div><div className="arrival-main"><strong>{etaLabel}</strong><span>{item.id} · {item.operator || 'Live bus'}{target ? ` · to ${target.name}` : ''}</span></div><div className="distance">{distanceLabel}<small>{item.source === 'hardware' ? 'GPS device' : 'Shared location'}</small></div></button>;
 }
 // Local-guide chatbot: pure client-side, curated Mangaluru/Tulunadu content keyed to stops
 // that actually appear on NAVIGO's routes. No AI backend or API key required — it's a
@@ -214,8 +229,8 @@ function LocalGuideWidget() {
     </div>}
   </>;
 }
-const LIGHT_BLUE = '#4fc3f7'; // bus -> boarding stop (before boarding)
-const DARK_BLUE = '#0b2f8a'; // current stop -> destination (after boarding)
+const LIGHT_BLUE = '#4fc3f7'; // passenger -> pickup stop (before boarding)
+const DARK_BLUE = '#0b2f8a'; // boarding stop -> destination (after boarding)
 const REFRESH_MS = 12000; // live ETA/route refresh (within the 10-15s range)
 function metersBetween(a, b) {
   const rad = d => d * Math.PI / 180, dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
@@ -235,10 +250,26 @@ const TRIP_CSS = `
 .trip-status.live{border-left-color:${DARK_BLUE}}
 .trip-status b{font-size:20px}
 .trip-status small{opacity:.75}
+.pickup-card .trip-status{margin-bottom:0}
+.pickup-card .trip-status strong{font-size:18px}
 .legend-line{display:inline-block;width:18px;height:5px;border-radius:3px;margin:0 6px 1px 12px;vertical-align:middle}
 .legend-line.light{background:${LIGHT_BLUE}}
 .legend-line.dark{background:${DARK_BLUE}}
 `;
+// Nearest (or selected) pickup stop, with the road distance from the passenger. Shown even when no bus is live.
+function PickupCard({ pickup }) {
+  if (!pickup?.stop) return null;
+  const distance = Number.isFinite(pickup.distanceKm) ? `${pickup.distanceKm} km by road${Number.isFinite(pickup.durationMin) ? ` · about ${pickup.durationMin} min ${pickup.travelMode === 'DRIVE' ? 'drive' : 'walk'}` : ''}` : null;
+  return <div className="trip-card pickup-card">
+    <p className="eyebrow">{pickup.locked ? 'BOARDING STOP' : 'YOUR PICKUP STOP'}</p>
+    <div className="trip-status">
+      <strong>{pickup.stop.name}</strong>
+      {!pickup.locked && <small>{distance || 'Road distance unavailable right now.'}</small>}
+      <small>{pickup.locked ? 'Stop where you boarded' : pickup.auto ? 'Nearest stop to you (automatic)' : 'Stop you selected'}</small>
+      {pickup.source === 'gps-fallback' && <small>Road routing is unavailable, so the nearest stop was picked by straight-line distance and no distance is shown.</small>}
+    </div>
+  </div>;
+}
 function TripPlanner({ selected, stopId, destinationId, journey, busy, onStop, onDestination, onStart, onEnd }) {
   const stops = selected?.routeStops || [];
   if (!stops.length) return null;
@@ -251,11 +282,11 @@ function TripPlanner({ selected, stopId, destinationId, journey, busy, onStop, o
   const destName = journey?.destination?.name;
   return <div className="trip-card">
     <p className="eyebrow">YOUR TRIP · BUS {selected.id}</p>
-    {started && <div className="trip-status live"><strong>Journey in progress · Bus {journey.busId}{destName ? ` → ${destName}` : ''}</strong><b>{etaText(journey.etaMinutes, journey.hasArrived)}</b>{journey.busOffline && <small>Bus location is not updating right now.</small>}{journey.warning && <small>{journey.warning}</small>}</div>}
+    {started && <div className="trip-status live"><strong>Journey in progress · Bus {journey.busId}{destName ? ` → ${destName}` : ''}</strong><b>{etaText(journey.etaMinutes, journey.hasArrived, journey.etaStatus)}</b>{journey.busOffline && <small>Bus location is not updating right now.</small>}{journey.warning && <small>{journey.warning}</small>}</div>}
     {completed && <div className="trip-status live"><strong>You have arrived{destName ? ` at ${destName}` : ''}.</strong></div>}
     {boarded && <div className="trip-status"><strong>Boarding detected on bus {journey.busId}.</strong><small>{journey.warning || 'Choose your destination stop to start the journey.'}</small></div>}
     <div className="trip-grid">
-      <label>Boarding stop<select value={stopId} onChange={e => onStop(e.target.value)} disabled={started || completed}><option value="">{`Auto · nearest stop${selected.boardingStopAuto && selected.boardingStop ? ` (${selected.boardingStop.name})` : ''}`}</option>{stops.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
+      <label>Boarding stop<select value={stopId} onChange={e => onStop(e.target.value)} disabled={started || completed || boarded}><option value="">{`Auto · nearest stop${selected.boardingStopAuto && selected.boardingStop ? ` (${selected.boardingStop.name})` : ''}`}</option>{stops.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
       <label>Destination stop<select value={destValue} onChange={e => onDestination(e.target.value)} disabled={completed}><option value="">Choose destination</option>{destOptions.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
     </div>
     <div className="trip-actions">
@@ -271,6 +302,8 @@ function Dashboard({ session, logout }) {
   const [arrivals, setArrivals] = useState([]);
   const [selected, setSelected] = useState(null);
   const [journey, setJourney] = useState(null);
+  const [pickup, setPickup] = useState(null);
+  const [noBusMessage, setNoBusMessage] = useState('');
   const [stopId, setStopId] = useState('');
   const [destinationId, setDestinationId] = useState('');
   const [status, setStatus] = useState('Share your location to find buses approaching you.');
@@ -285,7 +318,7 @@ function Dashboard({ session, logout }) {
     if (!position) return;
     const seq = ++requestSeq.current;
     setBusy(true);
-    setStatus('Finding traffic-aware arrival estimates...');
+    setStatus('Finding your nearest stop and live arrival estimates...');
     try {
       const body = { lat: position.lat, lng: position.lng, accuracy: position.accuracy ?? undefined, ...selection.current, ...override };
       const r = await fetch(`${API}/arrivals`, { method: 'POST', headers: authHeaders, body: JSON.stringify(body) });
@@ -296,6 +329,8 @@ function Dashboard({ session, logout }) {
       const nextJourney = data.journey || null;
       setArrivals(list);
       setJourney(nextJourney);
+      setPickup(data.pickup || null);
+      setNoBusMessage(list.length ? '' : data.message || 'No live bus data');
       if (nextJourney?.destination?.id) setDestinationId(nextJourney.destination.id);
       // Keep the previously selected bus selected across a refresh (matched by id) instead of
       // always resetting to the first result, so an arriving bus doesn't jump out from under the user.
@@ -304,7 +339,8 @@ function Dashboard({ session, logout }) {
         const journeyBusId = nextJourney && ['boarded', 'in_journey', 'completed'].includes(nextJourney.phase) ? nextJourney.busId : null;
         return (journeyBusId && list.find(item => item.id === journeyBusId)) || (current && list.find(item => item.id === current.id)) || list[0] || null;
       });
-      setStatus(list.length ? `Updated just now using ${data.provider}.` : 'No bus has shared a recent location yet.');
+      if (list.length) setStatus(data.provider === 'unavailable' ? data.routingWarning || 'Road routing is unavailable.' : `Updated just now using ${data.provider}.`);
+      else setStatus(data.routingWarning ? `${data.message || 'No live bus data'}. ${data.routingWarning}` : data.message || 'No live bus data');
     } catch (err) {
       if (seq === requestSeq.current) setStatus(err.message);
     } finally {
@@ -313,6 +349,7 @@ function Dashboard({ session, logout }) {
   }
   function applyPosition(p) {
     const next = { lat: p.coords.latitude, lng: p.coords.longitude, accuracy: Number.isFinite(p.coords.accuracy) ? p.coords.accuracy : null };
+    if (!Number.isFinite(next.lat) || !Number.isFinite(next.lng)) return; // ignore an invalid GPS fix
     positionRef.current = next;
     // Only move the map marker for real movement, so GPS jitter doesn't constantly redraw the map.
     setCustomer(current => current && metersBetween(current, next) < 10 ? current : { lat: next.lat, lng: next.lng });
@@ -376,13 +413,14 @@ function Dashboard({ session, logout }) {
       await fetch(`${API}/journey/end`, { method: 'POST', headers: authHeaders, body: '{}' });
     } catch { /* the next refresh reports the real state */ }
     setJourney(null);
-    calculate({ destinationStopId: null });
+    setStopId('');
     setDestinationId('');
+    calculate({ stopId: null, destinationStopId: null });
   }
   // Tapping a bus on the map starts the journey manually once a destination is chosen.
   function handleBusClick(id) {
     const item = arrivals.find(a => a.id === id);
-    if (!item) return;
+    if (!item) return setStatus(`Bus ${id} does not serve your pickup stop${pickup?.stop ? ` (${pickup.stop.name})` : ''}.`);
     if (journey && journey.phase !== 'boarded') return setSelected(item);
     if (destinationId && (item.routeStops || []).some(s => s.id === destinationId)) return startJourney(item);
     chooseBus(item);
@@ -390,22 +428,23 @@ function Dashboard({ session, logout }) {
   }
   const live = buses.filter(fresh).length;
   const inJourney = !!journey && (journey.phase === 'in_journey' || journey.phase === 'completed');
+  const journeyActive = !!journey && ['boarded', 'in_journey', 'completed'].includes(journey.phase);
   const selectedArrived = selected?.hasArrived || selected?.etaMinutes === 0;
-  const selectedEtaKnown = Number.isFinite(selected?.etaMinutes);
-  const showJourneyEta = inJourney && (journey.hasArrived || Number.isFinite(journey.etaMinutes));
-  // LIGHT BLUE bus -> stop line before boarding; DARK BLUE stop -> destination line only after the journey starts.
-  const routePolyline = inJourney ? journey.roadRoute?.encodedPolyline || null : journey?.phase === 'boarded' ? null : selected?.roadRoute?.encodedPolyline || null;
+  // LIGHT BLUE passenger -> pickup stop line before boarding; DARK BLUE boarding stop -> destination line only after the journey starts.
+  const routePolyline = inJourney ? journey.roadRoute?.encodedPolyline || null : journeyActive ? null : pickup?.roadRoute?.encodedPolyline || null;
   const routeColor = inJourney ? DARK_BLUE : LIGHT_BLUE;
   const stopMarkers = [];
   if (inJourney) {
-    if (journey.currentStop) stopMarkers.push({ key: 'current', ...journey.currentStop, label: 'S', color: DARK_BLUE, title: `Current stop: ${journey.currentStop.name}` });
+    if (journey.currentStop) stopMarkers.push({ key: 'current', ...journey.currentStop, label: 'S', color: DARK_BLUE, title: `Boarding stop: ${journey.currentStop.name}` });
     if (journey.destination) stopMarkers.push({ key: 'destination', ...journey.destination, label: 'D', color: DARK_BLUE, title: `Destination: ${journey.destination.name}` });
-  } else if (journey?.phase !== 'boarded' && selected?.boardingStop) {
-    stopMarkers.push({ key: 'boarding', ...selected.boardingStop, label: 'S', color: LIGHT_BLUE, title: `Boarding stop: ${selected.boardingStop.name}` });
+  } else if (!journeyActive && pickup?.stop) {
+    stopMarkers.push({ key: 'pickup', ...pickup.stop, label: 'S', color: LIGHT_BLUE, title: `Pickup stop: ${pickup.stop.name}` });
   }
   const stopMarkersKey = JSON.stringify(stopMarkers);
   const mapStops = useMemo(() => stopMarkers, [stopMarkersKey]);
-  return <main className="dashboard"><style>{TRIP_CSS}</style><header><div className="wordmark"><span>N</span> NAVIGO <small>LIVE</small></div><div className="account"><span>{session.user.email}</span><button className="text-button" onClick={logout}>Sign out</button></div></header><section className="dashboard-hero"><div><p className="eyebrow">LIVE ARRIVALS</p><h1>When is my bus coming?</h1><p>See the latest location and expected arrival time for buses near you.</p><button className="primary location-button" onClick={locate} disabled={busy}>{busy ? 'Updating arrivals...' : customer ? 'Refresh arrivals' : 'Use my location'}</button></div><div className="live-orb"><strong>{live}</strong><span>buses<br />live now</span></div></section><section className="map-shell"><LiveMap buses={buses} customer={customer} routePolyline={routePolyline} routeColor={routeColor} stops={mapStops} onBusClick={handleBusClick} /><div className="map-legend"><span className="legend-dot customer" /> Your location <span className="legend-dot bus" /> Bus{routePolyline && <><span className={`legend-line ${inJourney ? 'dark' : 'light'}`} />{inJourney ? 'Your route to destination' : 'Bus to stop'}</>}</div>{inJourney ? showJourneyEta && <div className="eta-bubble"><span>{journey.hasArrived ? 'Status' : 'Arrival at destination'}</span><strong>{journey.hasArrived ? 'You Have Arrived' : `${journey.etaMinutes} min`}</strong></div> : selected && (selectedArrived || selectedEtaKnown) && <div className="eta-bubble"><span>{selectedArrived ? 'Status' : 'Estimated arrival'}</span><strong>{selectedArrived ? 'Bus Arrived' : `${selected.etaMinutes} min`}</strong></div>}</section><section className="arrivals-panel"><div className="section-heading"><div><p className="eyebrow">ARRIVALS</p><h2>Nearby buses</h2></div><span className="status-pill"><i /> {live ? 'Live tracking' : 'No active tracking'}</span></div><p className="notice">{status}</p><div className="arrival-list">{arrivals.map(item => <Arrival key={item.id} item={item} selected={selected?.id === item.id} select={() => chooseBus(item)} />)}{!arrivals.length && <div className="empty-state"><strong>No arrivals to show yet</strong><span>Choose “Use my location” once your bus starts sharing its live location.</span></div>}</div><TripPlanner selected={selected} stopId={stopId} destinationId={destinationId} journey={journey} busy={busy} onStop={changeStop} onDestination={changeDestination} onStart={() => startJourney()} onEnd={endJourney} /></section><section className="how-it-works"><span>Live GPS updates</span><span>Traffic-aware travel time</span><span>Arrival updates every 12 seconds</span></section><LocalGuideWidget /></main>;
+  const emptyTitle = hasLocation ? (noBusMessage || 'No live bus data') : 'No arrivals to show yet';
+  const emptyText = hasLocation ? (pickup?.stop ? `Your pickup stop is ${pickup.stop.name}. Buses appear here as soon as one serving it shares a live location.` : 'Buses appear here as soon as one shares a live location.') : 'Choose “Use my location” once your bus starts sharing its live location.';
+  return <main className="dashboard"><style>{TRIP_CSS}</style><header><div className="wordmark"><span>N</span> NAVIGO <small>LIVE</small></div><div className="account"><span>{session.user.email}</span><button className="text-button" onClick={logout}>Sign out</button></div></header><section className="dashboard-hero"><div><p className="eyebrow">LIVE ARRIVALS</p><h1>When is my bus coming?</h1><p>See the latest location and expected arrival time for buses near you.</p><button className="primary location-button" onClick={locate} disabled={busy}>{busy ? 'Updating arrivals...' : customer ? 'Refresh arrivals' : 'Use my location'}</button></div><div className="live-orb"><strong>{live}</strong><span>buses<br />live now</span></div></section><section className="map-shell"><LiveMap buses={buses} customer={customer} routePolyline={routePolyline} routeColor={routeColor} stops={mapStops} onBusClick={handleBusClick} /><div className="map-legend"><span className="legend-dot customer" /> Your location <span className="legend-dot bus" /> Bus{routePolyline && <><span className={`legend-line ${inJourney ? 'dark' : 'light'}`} />{inJourney ? 'Your route to destination' : 'You to pickup stop'}</>}</div>{inJourney ? <div className="eta-bubble"><span>{journey.hasArrived ? 'Status' : 'Arrival at destination'}</span><strong>{journey.hasArrived ? 'You Have Arrived' : etaText(journey.etaMinutes, journey.hasArrived, journey.etaStatus)}</strong></div> : !journeyActive && selected && <div className="eta-bubble"><span>{selectedArrived ? 'Status' : 'Estimated arrival'}</span><strong>{selectedArrived ? 'Bus Arrived' : etaText(selected.etaMinutes, selected.hasArrived, selected.etaStatus)}</strong></div>}</section><section className="arrivals-panel"><div className="section-heading"><div><p className="eyebrow">ARRIVALS</p><h2>Nearby buses</h2></div><span className="status-pill"><i /> {live ? 'Live tracking' : 'No active tracking'}</span></div><p className="notice">{status}</p><div className="arrival-list">{arrivals.map(item => <Arrival key={item.id} item={item} selected={selected?.id === item.id} select={() => chooseBus(item)} />)}{!arrivals.length && <div className="empty-state"><strong>{emptyTitle}</strong><span>{emptyText}</span></div>}</div><PickupCard pickup={pickup} /><TripPlanner selected={selected} stopId={stopId} destinationId={destinationId} journey={journey} busy={busy} onStop={changeStop} onDestination={changeDestination} onStart={() => startJourney()} onEnd={endJourney} /></section><section className="how-it-works"><span>Live GPS updates</span><span>Traffic-aware travel time</span><span>Arrival updates every 12 seconds</span></section><LocalGuideWidget /></main>;
 }
 function DriverConsole({ session, logout }) { const buses = useBuses(); const bus = buses.find(item => item.id === session.user.busId); const online = bus && fresh(bus); return <main className="dashboard driver-console"><header><div className="wordmark"><span>N</span> NAVIGO <small>DRIVER</small></div><div className="account"><span>{session.user.email}</span><button className="text-button" onClick={logout}>Sign out</button></div></header><section className="driver-header"><div><p className="eyebrow">DRIVER CONSOLE</p><h1>Today’s bus status</h1><p>This account is assigned to bus <strong>{session.user.busId}</strong>. Keep its GPS unit powered so customers can see live arrival times.</p></div><span className={`connection ${online ? 'online' : ''}`}><i /> {online ? 'Device connected' : 'Waiting for device'}</span></section><section className="driver-grid"><article className="driver-card"><p className="field-label">ASSIGNED BUS</p><div className="bus-status"><span className="route-chip">{bus?.routeId?.split('-')[0]?.toUpperCase() || '—'}</span><div><strong>{session.user.busId}</strong><span>{bus?.operator || 'Bus assignment verified'}</span></div></div><dl><div><dt>GPS update</dt><dd>{online ? 'Receiving live location' : 'No recent update'}</dd></div><div><dt>Passenger visibility</dt><dd>{online ? 'Visible in customer app' : 'Not visible yet'}</dd></div><div><dt>Occupancy</dt><dd>{bus?.occupancy || 'Not reported'}</dd></div></dl></article><article className="driver-card help-card"><p className="eyebrow">DEVICE CHECK</p><h2>Before leaving</h2><ol><li>Connect the GPS device to power.</li><li>Make sure its mobile data is on.</li><li>Wait for “Device connected” above.</li></ol><p className="notice">The device sends the location automatically. There is nothing to update while driving.</p></article></section><section className="map-shell driver-map"><LiveMap buses={bus ? [bus] : []} /><div className="map-legend"><span className="legend-dot bus" /> Assigned bus location</div></section></main>; }
 function DriverConsoleV2({ session, logout }) {

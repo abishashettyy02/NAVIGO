@@ -156,6 +156,9 @@ function field(row, ...names) {
   return '';
 }
 
+// Two Stop_Master rows with the same name closer together than this are the same physical stop.
+const SAME_STOP_METERS = 30;
+
 function loadWorkbook() {
   const workbookPath = workbookCandidates().find(candidate => {
     try {
@@ -180,14 +183,21 @@ function loadWorkbook() {
     if (!routeSheet) throw new Error('Route_Master sheet is missing');
     if (!stopSheet) throw new Error('Stop_Master sheet is missing');
 
-    /* ---- Stops: id, name and coordinates come only from Stop_Master ---- */
+    /*
+      ---- Stops: id, name and coordinates come only from Stop_Master ----
+      The same stop name can appear on several rows with different coordinates (for example
+      "Kankanady" ST006 and ST054). Rows that are within SAME_STOP_METERS of an earlier row with
+      the same name are merged; genuinely different rows become variants ("kankanady",
+      "kankanady-2"). Each route later picks the variant that fits its own neighbouring stops.
+    */
     const stops = [];
     const stopsById = new Map();
+    const stopsByName = new Map();
 
     for (const row of sheetRows(stopSheet)) {
       const name = cleanText(field(row, 'stopname', 'stop', 'name'));
-      const id = slug(name);
-      if (!id || stopsById.has(id)) continue;
+      const base = slug(name);
+      if (!base) continue;
 
       const lat = toFinite(field(row, 'latitude', 'lat'));
       const lng = toFinite(field(row, 'longitude', 'lng', 'lon'));
@@ -196,20 +206,26 @@ function loadWorkbook() {
         continue;
       }
 
+      const variants = stopsByName.get(base) || [];
+      if (variants.some(existing => haversineMeters(existing.lat, existing.lng, lat, lng) <= SAME_STOP_METERS)) continue;
+
       const stop = {
-        id,
+        id: variants.length ? `${base}-${variants.length + 1}` : base,
         code: cleanText(field(row, 'stopid')) || null,
         name: prettyName(name),
         lat,
         lng,
         confidence: cleanText(field(row, 'sourceconfidence')) || null
       };
+      variants.push(stop);
+      stopsByName.set(base, variants);
       stops.push(stop);
-      stopsById.set(id, stop);
+      stopsById.set(stop.id, stop);
     }
 
-    /* ---- Schedules from Bus_Schedule, matched to buses by "BUS NO.|BUS" ---- */
+    /* ---- Schedules from Bus_Schedule, matched to buses by "BUS NO.|BUS" (or by bus number alone) ---- */
     const scheduleByKey = new Map();
+    const schedulesByNumber = new Map();
     const timetableRows = [];
 
     for (const row of sheetRows(scheduleSheet)) {
@@ -235,6 +251,11 @@ function loadWorkbook() {
 
       const key = `${slug(busNo)}|${slug(operator)}`;
       if (!scheduleByKey.has(key)) scheduleByKey.set(key, schedule);
+      if (busNo) {
+        const list = schedulesByNumber.get(slug(busNo)) || [];
+        list.push(schedule);
+        schedulesByNumber.set(slug(busNo), list);
+      }
 
       timetableRows.push({
         Route: routeText,
@@ -244,6 +265,14 @@ function loadWorkbook() {
         ...schedule
       });
     }
+
+    // Exact "number|operator" match first; otherwise a bus number that has exactly one schedule row.
+    const scheduleFor = (number, operator) => {
+      const exact = scheduleByKey.get(`${slug(number)}|${slug(operator)}`);
+      if (exact) return exact;
+      const sameNumber = number ? schedulesByNumber.get(slug(number)) : null;
+      return sameNumber && sameNumber.length === 1 ? sameNumber[0] : null;
+    };
 
     /* ---- Routes + buses from Route_Master (one row = one bus on one route) ---- */
     const routes = [];
@@ -258,18 +287,36 @@ function loadWorkbook() {
         .filter(key => /^stop\d+$/.test(normKey(key)))
         .sort((a, b) => Number(normKey(a).slice(4)) - Number(normKey(b).slice(4)));
 
-      const stopIds = [];
       const missing = [];
+      const options = [];
       for (const column of stopColumns) {
         const name = cleanText(row[column]);
         if (!name) continue;
-        const id = slug(name);
-        if (!stopsById.has(id)) {
+        const list = stopsByName.get(slug(name)) || [];
+        if (!list.length) {
           missing.push(name);
           continue;
         }
-        if (stopIds[stopIds.length - 1] === id) continue;
-        stopIds.push(id);
+        options.push(list);
+      }
+
+      // Unambiguous stops first; then each ambiguous name takes the variant with the smallest detour
+      // between its previous and next resolved neighbours on this route.
+      const resolved = options.map(list => (list.length === 1 ? list[0] : null));
+      options.forEach((list, i) => {
+        if (list.length < 2) return;
+        let previous = null;
+        for (let j = i - 1; j >= 0 && !previous; j -= 1) previous = resolved[j];
+        let next = null;
+        for (let j = i + 1; j < resolved.length && !next; j += 1) next = resolved[j];
+        const cost = candidate => (previous ? haversineMeters(previous.lat, previous.lng, candidate.lat, candidate.lng) : 0) + (next ? haversineMeters(candidate.lat, candidate.lng, next.lat, next.lng) : 0);
+        resolved[i] = list.reduce((best, candidate) => (cost(candidate) < cost(best) ? candidate : best), list[0]);
+      });
+
+      const stopIds = [];
+      for (const stop of resolved) {
+        if (stopIds[stopIds.length - 1] === stop.id) continue;
+        stopIds.push(stop.id);
       }
 
       const label = `${number || 'unnumbered'} ${operator}`.trim();
@@ -292,7 +339,7 @@ function loadWorkbook() {
         routeId = `${slug(routeNumber)}-${slug(operator) || 'bus'}-${suffix}`;
       }
 
-      const schedule = scheduleByKey.get(`${slug(number)}|${slug(operator)}`) || null;
+      const schedule = scheduleFor(number, operator);
 
       const route = {
         id: routeId,
@@ -480,7 +527,8 @@ const auth = roles => (req, res, next) => {
 
 /*
   A bus is "arrived" once it is this close to the stop, measured with GPS/Haversine distance
-  (not Google's road distance) against the exact, unrounded distance in meters.
+  (not Google's road distance) against the exact, unrounded distance in meters. This is the
+  single arrival threshold used for both pickup-stop arrival and destination arrival.
 */
 const ARRIVAL_THRESHOLD_METERS = 20;
 
@@ -517,6 +565,20 @@ const COMPLETED_RETENTION_MS = 2 * 60 * 1000;
 const TRACKER_TTL_MS = 10 * 60 * 1000;
 const JOURNEY_TTL_MS = 6 * 60 * 60 * 1000;
 
+/*
+  Pickup-stop selection. The nearest few stops (by straight line, used only to shortlist) are
+  ranked by REAL road distance from Google Routes. The passenger travels this leg on foot, so
+  it uses the WALK travel mode; set USER_TRAVEL_MODE to 'DRIVE' to rank by driving distance.
+  The previously chosen stop is kept unless another stop is clearly closer, so the pickup does
+  not flip back and forth while the passenger stands between two stops.
+*/
+const USER_TRAVEL_MODE = process.env.USER_TRAVEL_MODE === 'DRIVE' ? 'DRIVE' : 'WALK';
+const PICKUP_CANDIDATES = 4;
+const PICKUP_PREVIOUS_RANK_LIMIT = 6;
+const PICKUP_SWITCH_RATIO = 1.15;
+const PICKUP_SWITCH_METERS = 30;
+const PICKUP_TTL_MS = 30 * 60 * 1000;
+
 const GOOGLE_ROUTES_URL = process.env.GOOGLE_ROUTES_URL || 'https://routes.googleapis.com/directions/v2:computeRoutes';
 
 /* =========================
@@ -547,8 +609,7 @@ function activeBuses() {
   return [...buses.values()].filter(
     bus =>
       Number.isFinite(bus.updatedAt) &&
-      Number.isFinite(bus.lat) &&
-      Number.isFinite(bus.lng) &&
+      validCoords(bus) &&
       now - bus.updatedAt < BUS_FRESHNESS_MS &&
       (!enforceServiceWindow || isInServiceWindow(bus.schedule))
   );
@@ -577,6 +638,8 @@ function haversineMeters(lat1, lng1, lat2, lng2) {
 }
 
 // Straight-line GPS distance between two {lat,lng} points, or null when either is unusable.
+// Used for arrival/boarding detection and as a shortlist/fallback for nearest-stop selection only,
+// never for a displayed ETA or distance.
 function gpsDistance(a, b) {
   const meters = haversineMeters(a?.lat, a?.lng, b?.lat, b?.lng);
   return Number.isFinite(meters) ? meters : null;
@@ -636,19 +699,20 @@ function computeSpeedKmh(previous, next) {
 
 let warnedMissingRoutesKey = false;
 
-async function requestRoute(apiKey, origin, destination, waypoints) {
+async function requestRoute(apiKey, origin, destination, waypoints, mode = 'DRIVE') {
   const latLng = point => ({ latLng: { latitude: point.lat, longitude: point.lng } });
 
   const body = {
     origin: { location: latLng(origin) },
     destination: { location: latLng(destination) },
-    /*
-      DRIVE allows road-based routing. TRAFFIC_AWARE makes Google's returned duration account
-      for current traffic conditions.
-    */
-    travelMode: 'DRIVE',
-    routingPreference: 'TRAFFIC_AWARE'
+    travelMode: mode
   };
+
+  /*
+    DRIVE allows road-based routing and TRAFFIC_AWARE makes Google's returned duration account for
+    current traffic. routingPreference is only valid for DRIVE/TWO_WHEELER, so it is omitted for WALK.
+  */
+  if (mode === 'DRIVE') body.routingPreference = 'TRAFFIC_AWARE';
 
   if (waypoints.length) {
     // via:true keeps intermediate bus stops as pass-through points rather than stopovers.
@@ -680,7 +744,8 @@ async function requestRoute(apiKey, origin, destination, waypoints) {
   // Google returns duration as a string such as "123s".
   const durationMatch = String(route.duration || '').match(/^([\d.]+)s$/);
   const durationSeconds = durationMatch ? Number(durationMatch[1]) : Number.NaN;
-  const distanceMeters = Number(route.distanceMeters);
+  // Google omits distanceMeters (protobuf default) when it is 0, e.g. when the origin is already at the destination.
+  const distanceMeters = Number(route.distanceMeters ?? 0);
 
   const durationValid = Number.isFinite(durationSeconds) && durationSeconds >= 0;
   const distanceValid = Number.isFinite(distanceMeters) && distanceMeters >= 0;
@@ -699,11 +764,12 @@ async function requestRoute(apiKey, origin, destination, waypoints) {
 }
 
 /*
-  Real road distance and traffic-aware travel duration between two points, optionally passing
-  through ordered intermediate points (the bus route's own stops). Returns
-  { durationSeconds, distanceMeters, encodedPolyline } or null.
+  Real road distance and duration between two points, optionally passing through ordered
+  intermediate points (the bus route's own stops). `mode` is 'DRIVE' (traffic-aware, for buses)
+  or 'WALK' (for the passenger). Returns { durationSeconds, distanceMeters, encodedPolyline } or
+  null; throws when Google returns an error so callers can report it.
 */
-async function routeToLocation(origin, destination, intermediates = []) {
+async function routeToLocation(origin, destination, intermediates = [], mode = 'DRIVE') {
   const apiKey = process.env.GOOGLE_ROUTES_API_KEY;
 
   if (!apiKey) {
@@ -728,11 +794,11 @@ async function routeToLocation(origin, destination, intermediates = []) {
     .slice(0, 25);
 
   try {
-    return await requestRoute(apiKey, from, to, waypoints);
+    return await requestRoute(apiKey, from, to, waypoints, mode);
   } catch (error) {
     if (!waypoints.length) throw error;
     console.warn(`Route via bus stops failed (${error.message}); retrying direct.`);
-    return requestRoute(apiKey, from, to, []);
+    return requestRoute(apiKey, from, to, [], mode);
   }
 }
 
@@ -1092,6 +1158,112 @@ app.post('/api/journeys/search', auth(['passenger']), (req, res) => {
 });
 
 /* =========================
+   PICKUP STOP (nearest stop by ROAD distance)
+
+   pickups  userId -> { stopId, at }   the stop last chosen for this passenger (for hysteresis)
+========================= */
+
+const pickups = new Map();
+
+// Stops the passenger may be picked up at: the selected bus's route, otherwise every stop that any route serves.
+function eligibleStopPool(selection) {
+  const selectedRoute = routeOf(selection.busId ? buses.get(selection.busId) : null);
+  if (selectedRoute) return routeStopObjects(selectedRoute);
+
+  const ids = new Set();
+  for (const route of transit.routes) for (const id of route.stops) ids.add(id);
+  return [...ids].map(id => transit.stopsById.get(id)).filter(Boolean);
+}
+
+// Road route passenger -> stop, cached per passenger/stop and refreshed when the passenger moves.
+const walkRoute = (userId, stop, location) =>
+  cachedRoute(`walk:${userId}:${stop.id}`, positionFingerprint(location), ROUTE_TTL_MS, () => routeToLocation(location, stop, [], USER_TRAVEL_MODE));
+
+function pickupView(stop, auto, route, source) {
+  const durationMin = route && Number.isFinite(route.durationSeconds) ? Math.max(1, Math.ceil(route.durationSeconds / 60)) : null;
+  const distanceMeters = route && Number.isFinite(route.distanceMeters) ? route.distanceMeters : null;
+
+  return {
+    stop: stopView(stop),
+    auto,
+    locked: false,
+    source, // 'google-road' | 'gps-fallback' | 'unavailable' | 'journey'
+    travelMode: USER_TRAVEL_MODE,
+    distanceMeters,
+    distanceKm: kmFrom(distanceMeters),
+    durationMin,
+    roadRoute: route?.encodedPolyline ? { encodedPolyline: route.encodedPolyline } : null
+  };
+}
+
+// Once boarding is detected the pickup stays on the stop the passenger boarded at.
+function lockedPickup(journey) {
+  const stop = journey ? transit.stopsById.get(journey.currentStopId) : null;
+  if (!stop) return null;
+  return { ...pickupView(stop, false, null, 'journey'), locked: true };
+}
+
+async function resolvePickup(userId, location, selection) {
+  const pool = eligibleStopPool(selection);
+  if (!pool.length) return null;
+
+  const now = Date.now();
+
+  // 1) The passenger picked a stop: use it and just draw the road route to it.
+  const chosen = selection.stopId ? pool.find(stop => stop.id === selection.stopId) : null;
+  if (chosen) {
+    let route = null;
+    try {
+      route = await walkRoute(userId, chosen, location);
+    } catch (error) {
+      console.error(`Road route to selected stop ${chosen.id} failed:`, error?.message || error);
+    }
+    pickups.set(userId, { stopId: chosen.id, at: now });
+    return pickupView(chosen, false, route, route ? 'google-road' : 'unavailable');
+  }
+
+  // 2) Automatic: shortlist by straight line, then rank the shortlist by Google road distance.
+  const ranked = pool
+    .map(stop => ({ stop, meters: gpsDistance(stop, location) }))
+    .filter(item => item.meters !== null)
+    .sort((a, b) => a.meters - b.meters);
+  if (!ranked.length) return null;
+
+  const candidates = ranked.slice(0, PICKUP_CANDIDATES).map(item => item.stop);
+  const previousId = pickups.get(userId)?.stopId;
+  const previous = previousId ? ranked.slice(0, PICKUP_PREVIOUS_RANK_LIMIT).find(item => item.stop.id === previousId)?.stop : null;
+  if (previous && !candidates.some(stop => stop.id === previous.id)) candidates.push(previous);
+
+  const settled = await Promise.allSettled(candidates.map(stop => walkRoute(userId, stop, location)));
+
+  const scored = [];
+  let firstFailure = null;
+  settled.forEach((result, index) => {
+    if (result.status === 'fulfilled' && result.value && Number.isFinite(result.value.distanceMeters)) {
+      scored.push({ stop: candidates[index], route: result.value });
+    } else if (result.status === 'rejected' && !firstFailure) {
+      firstFailure = result.reason?.message || String(result.reason);
+    }
+  });
+
+  // Google failed for every candidate (or is not configured): Haversine picks the stop, no distance is displayed.
+  if (!scored.length) {
+    if (firstFailure) console.error('Nearest-stop road routing failed; using straight-line fallback:', firstFailure);
+    const fallback = ranked[0].stop;
+    pickups.set(userId, { stopId: fallback.id, at: now });
+    return pickupView(fallback, true, null, 'gps-fallback');
+  }
+
+  scored.sort((a, b) => a.route.distanceMeters - b.route.distanceMeters);
+  let best = scored[0];
+  const keep = previous ? scored.find(item => item.stop.id === previous.id) : null;
+  if (keep && keep.route.distanceMeters <= best.route.distanceMeters * PICKUP_SWITCH_RATIO + PICKUP_SWITCH_METERS) best = keep;
+
+  pickups.set(userId, { stopId: best.stop.id, at: now });
+  return pickupView(best.stop, true, best.route, 'google-road');
+}
+
+/* =========================
    BOARDING DETECTION + JOURNEY STATE
 
    Per passenger (in memory):
@@ -1108,15 +1280,16 @@ function resetTracker(tracker) {
   tracker.count = 0;
   tracker.firstBus = null;
   tracker.firstUser = null;
+  tracker.firstStopId = null;
   tracker.confirmed = false;
 }
 
-function updateTracker(userId, bus, location, accuracy, now) {
+function updateTracker(userId, bus, location, accuracy, now, pickupStopId) {
   const key = `${userId}|${bus.id}`;
   let tracker = boardingTrackers.get(key);
 
   if (!tracker) {
-    tracker = { count: 0, lastCountedAt: 0, firstBus: null, firstUser: null, confirmed: false, touchedAt: now };
+    tracker = { count: 0, lastCountedAt: 0, firstBus: null, firstUser: null, firstStopId: null, confirmed: false, touchedAt: now };
     boardingTrackers.set(key, tracker);
   }
 
@@ -1142,6 +1315,8 @@ function updateTracker(userId, bus, location, accuracy, now) {
     if (tracker.count === 0) {
       tracker.firstBus = { lat: bus.lat, lng: bus.lng };
       tracker.firstUser = { lat: location.lat, lng: location.lng };
+      // The pickup stop the passenger was waiting at when the bus first came alongside.
+      tracker.firstStopId = pickupStopId || null;
     }
     tracker.count = Math.min(tracker.count + 1, 30);
   } else if (distance > BOARDING_RESET_METERS) {
@@ -1160,7 +1335,7 @@ function updateTracker(userId, bus, location, accuracy, now) {
   return tracker;
 }
 
-function detectBoarding(userId, live, location, accuracy) {
+function detectBoarding(userId, live, location, accuracy, pickupStopId) {
   const now = Date.now();
   const trackers = new Map();
   let best = null;
@@ -1169,7 +1344,7 @@ function detectBoarding(userId, live, location, accuracy) {
     const suppressedUntil = boardingSuppressed.get(`${userId}|${bus.id}`);
     if (suppressedUntil && suppressedUntil > now) continue;
 
-    const tracker = updateTracker(userId, bus, location, accuracy, now);
+    const tracker = updateTracker(userId, bus, location, accuracy, now, pickupStopId);
     trackers.set(bus.id, tracker);
 
     if (tracker.confirmed) {
@@ -1197,6 +1372,10 @@ function cleanupJourneyState() {
   for (const [key, journey] of journeys) {
     if (now - journey.lastSeenAt > JOURNEY_TTL_MS) journeys.delete(key);
   }
+
+  for (const [key, pickup] of pickups) {
+    if (now - pickup.at > PICKUP_TTL_MS) pickups.delete(key);
+  }
 }
 
 function clearTrackersFor(userId) {
@@ -1223,16 +1402,23 @@ function resolveJourneyStops(bus, currentStopId, destinationStopId) {
   return { route, stops: routeStopObjects(route), from, to };
 }
 
-// The passenger's boarding stop for a bus: the selected stop if it is on the route, else the nearest route stop.
-function pickBoardingStop(bus, location, selection) {
+/*
+  The stop the passenger boarded at: the pickup stop they were waiting at when the bus first came
+  alongside (if it is on this bus's route), else the stop they selected, else the route stop nearest
+  to where they were standing (Haversine is only a last-resort fallback here).
+*/
+function pickBoardingStop(bus, location, selection, tracker) {
   const stops = routeStopObjects(routeOf(bus));
   if (!stops.length) return null;
+
+  const hinted = tracker?.firstStopId ? stops.find(stop => stop.id === tracker.firstStopId) : null;
+  if (hinted) return hinted;
 
   const selectionApplies = !selection.busId || selection.busId === bus.id;
   const chosen = selectionApplies && selection.stopId ? stops.find(stop => stop.id === selection.stopId) : null;
   if (chosen) return chosen;
 
-  return nearestStop(stops, location)?.stop || null;
+  return nearestStop(stops, tracker?.firstUser || location)?.stop || null;
 }
 
 /* Synchronous state transitions; Google lookups happen afterwards in buildJourneyView. */
@@ -1284,7 +1470,8 @@ function advanceJourney(userId, detection, selection, location) {
 
   if (!journey && detection.boardedBusId) {
     const bus = buses.get(detection.boardedBusId);
-    const currentStop = pickBoardingStop(bus, location, selection);
+    const tracker = detection.trackers.get(detection.boardedBusId);
+    const currentStop = pickBoardingStop(bus, location, selection, tracker);
 
     journey = {
       userId,
@@ -1318,7 +1505,7 @@ function advanceJourney(userId, detection, selection, location) {
   return journey;
 }
 
-/* Passenger-facing journey object (includes the DARK BLUE road route and the ETA to the destination). */
+/* Passenger-facing journey object (includes the DARK BLUE road route and the ROAD ETA to the destination). */
 async function buildJourneyView(journey) {
   if (!journey) return null;
 
@@ -1339,6 +1526,7 @@ async function buildJourneyView(journey) {
     currentStop: stopView(currentStop),
     destination: stopView(destination),
     etaMinutes: null,
+    etaStatus: journey.phase === 'boarded' ? 'awaiting-destination' : 'unavailable',
     hasArrived: false,
     distanceMeters: null,
     distanceKm: null,
@@ -1350,11 +1538,12 @@ async function buildJourneyView(journey) {
   if (journey.phase === 'boarded') return view;
 
   if (journey.phase === 'completed') {
-    return { ...view, etaMinutes: 0, hasArrived: true, distanceMeters: 0, distanceKm: 0 };
+    return { ...view, etaMinutes: 0, etaStatus: 'arrived', hasArrived: true, distanceMeters: 0, distanceKm: 0 };
   }
 
   const fresh = bus && validCoords(bus) && Number.isFinite(bus.updatedAt) && now - bus.updatedAt < BUS_FRESHNESS_MS;
   view.busOffline = !fresh;
+  if (!fresh) view.etaStatus = 'no-live-data';
 
   if (!route || !currentStop || !destination) return view;
 
@@ -1362,7 +1551,7 @@ async function buildJourneyView(journey) {
   const to = route.stops.indexOf(destination.id);
   if (from < 0 || to <= from) return view;
 
-  // DARK BLUE route: current bus stop -> destination stop, following the bus's ordered stops.
+  // DARK BLUE route: boarding stop -> destination stop, following the bus's ordered stops.
   let staticRoute = null;
   try {
     const between = stops.slice(from + 1, to);
@@ -1404,10 +1593,12 @@ async function buildJourneyView(journey) {
   }
 
   const roadDistance = etaRoute && Number.isFinite(etaRoute.distanceMeters) ? etaRoute.distanceMeters : null;
+  const etaMinutes = etaMinutesFromRoute(etaRoute, bus?.speedKmh);
 
   return {
     ...view,
-    etaMinutes: etaMinutesFromRoute(etaRoute, bus?.speedKmh),
+    etaMinutes,
+    etaStatus: !fresh ? 'no-live-data' : etaMinutes !== null ? 'ok' : 'unavailable',
     distanceMeters: roadDistance,
     distanceKm: kmFrom(roadDistance),
     roadRoute: staticRoute || etaRoute
@@ -1418,33 +1609,24 @@ async function buildJourneyView(journey) {
    ARRIVALS / LIVE ETA
 ========================= */
 
-async function buildArrival(bus, location, selection, trackers) {
+/*
+  Arrival card for one live bus heading to the passenger's pickup stop. Arrival detection uses the
+  GPS/Haversine distance (<= ARRIVAL_THRESHOLD_METERS); every DISPLAYED distance/ETA comes from the
+  Google road route bus -> stop. When Google gives nothing, etaMinutes stays null and etaStatus says why.
+*/
+async function buildArrival(bus, pickupStop, trackers) {
   const route = routeOf(bus);
   const stops = routeStopObjects(route);
-  const selectionApplies = !selection.busId || selection.busId === bus.id;
-  const chosen = selectionApplies && selection.stopId ? stops.find(stop => stop.id === selection.stopId) : null;
+  const stopIndex = stops.findIndex(stop => stop.id === pickupStop.id);
 
-  // Stop selected by the passenger, otherwise the nearest stop on THIS bus's own route.
-  const boardingStop = chosen || nearestStop(stops, location)?.stop || null;
-  const boardingStopIndex = boardingStop ? stops.indexOf(boardingStop) : -1;
-
-  // Routes without usable stops fall back to the passenger's own position as the target.
-  const target = boardingStop || location;
-
-  /*
-    Arrival detection uses GPS/Haversine distance between the bus's last reported position and
-    the stop — NOT Google's road distance — and does not depend on the Google call below.
-  */
-  const gpsDistanceMeters = gpsDistance(bus, target);
+  const gpsDistanceMeters = gpsDistance(bus, pickupStop);
   const hasArrived = gpsDistanceMeters !== null && gpsDistanceMeters <= ARRIVAL_THRESHOLD_METERS;
 
-  // LIGHT BLUE route: live road route from the bus to the boarding stop (skipped once arrived).
+  // Live road route from the bus to the pickup stop (skipped once arrived).
   let road = null;
   if (!hasArrived) {
     try {
-      road = await cachedRoute(`arrival:${bus.id}>${boardingStop?.id || `user:${positionFingerprint(location)}`}`, positionFingerprint(bus), ROUTE_TTL_MS, () =>
-        routeToLocation(bus, target)
-      );
+      road = await cachedRoute(`arrival:${bus.id}>${pickupStop.id}`, positionFingerprint(bus), ROUTE_TTL_MS, () => routeToLocation(bus, pickupStop));
     } catch (error) {
       console.error(`ETA calculation failed for bus ${bus.id}:`, error?.message || error);
     }
@@ -1454,26 +1636,34 @@ async function buildArrival(bus, location, selection, trackers) {
   const roadDistanceMeters = road && Number.isFinite(road.distanceMeters) ? road.distanceMeters : null;
   const etaMinutes = hasArrived ? 0 : etaMinutesFromRoute(road, speedKmh);
 
-  // Display distance is the road distance; once arrived the exact GPS distance is shown instead.
-  const distanceMeters = hasArrived ? gpsDistanceMeters : roadDistanceMeters;
-
   let etaSource = null;
-  if (hasArrived) etaSource = 'gps-arrival';
-  else if (etaMinutes !== null) etaSource = Number.isFinite(road?.durationSeconds) ? 'google-road' : 'road-distance-speed';
+  let etaStatus = 'unavailable';
+  if (hasArrived) {
+    etaSource = 'gps-arrival';
+    etaStatus = 'arrived';
+  } else if (etaMinutes !== null) {
+    etaSource = Number.isFinite(road?.durationSeconds) ? 'google-road' : 'road-distance-speed';
+    etaStatus = 'ok';
+  }
+
+  const targetStop = stopView(pickupStop);
 
   return {
     ...bus,
     routeName: route?.name || bus.routeName || null,
     etaMinutes,
     etaSource,
-    distanceMeters,
-    distanceKm: kmFrom(distanceMeters),
+    etaStatus,
+    // Road distance only; once arrived there is nothing left to show.
+    distanceMeters: hasArrived ? null : roadDistanceMeters,
+    distanceKm: hasArrived ? null : kmFrom(roadDistanceMeters),
     gpsDistanceMeters: round1(gpsDistanceMeters),
     hasArrived,
-    boardingStop: stopView(boardingStop),
-    boardingStopIndex,
-    boardingStopAuto: !chosen,
-    stopDistanceMeters: round1(boardingStop ? gpsDistance(boardingStop, location) : null),
+    boardingStop: targetStop,
+    targetStop,
+    boardingStopIndex: stopIndex,
+    boardingStopAuto: true,
+    stopDistanceMeters: null,
     routeStops: stops.map(stopView),
     roadRoute: road,
     speedKmh,
@@ -1484,6 +1674,65 @@ async function buildArrival(bus, location, selection, trackers) {
     }
   };
 }
+
+// Keeps a bus visible when its ETA could not be calculated at all.
+function fallbackArrival(bus, pickupStop) {
+  const stops = routeStopObjects(routeOf(bus));
+  const targetStop = stopView(pickupStop);
+  return {
+    ...bus,
+    etaMinutes: null,
+    etaSource: null,
+    etaStatus: 'unavailable',
+    distanceMeters: null,
+    distanceKm: null,
+    gpsDistanceMeters: null,
+    hasArrived: false,
+    boardingStop: targetStop,
+    targetStop,
+    boardingStopIndex: stops.findIndex(stop => stop.id === pickupStop.id),
+    boardingStopAuto: true,
+    stopDistanceMeters: null,
+    routeStops: stops.map(stopView),
+    roadRoute: null,
+    speedKmh: Number.isFinite(bus?.speedKmh) ? bus.speedKmh : null,
+    inService: true,
+    boardingProgress: { matches: 0, required: BOARDING_CONSECUTIVE_UPDATES }
+  };
+}
+
+// While a journey is active the list shows only the passenger's bus, with the ETA to their destination.
+function journeyArrival(bus, view) {
+  const stops = routeStopObjects(routeOf(bus));
+  const targetStop = view.destination || view.currentStop || null;
+  return {
+    ...bus,
+    routeName: routeOf(bus)?.name || bus.routeName || null,
+    etaMinutes: view.etaMinutes,
+    etaSource: view.hasArrived ? 'gps-arrival' : Number.isFinite(view.etaMinutes) ? 'google-road' : null,
+    etaStatus: view.etaStatus,
+    distanceMeters: view.distanceMeters,
+    distanceKm: view.distanceKm,
+    gpsDistanceMeters: null,
+    hasArrived: view.hasArrived,
+    boardingStop: view.currentStop,
+    targetStop,
+    boardingStopIndex: stops.findIndex(stop => stop.id === view.currentStop?.id),
+    boardingStopAuto: false,
+    stopDistanceMeters: null,
+    routeStops: stops.map(stopView),
+    roadRoute: null,
+    speedKmh: Number.isFinite(bus?.speedKmh) ? bus.speedKmh : null,
+    inService: true,
+    boardingProgress: { matches: BOARDING_CONSECUTIVE_UPDATES, required: BOARDING_CONSECUTIVE_UPDATES }
+  };
+}
+
+const sortArrivals = list =>
+  list.sort((a, b) => {
+    if (a.hasArrived !== b.hasArrived) return a.hasArrived ? -1 : 1;
+    return (a.etaMinutes ?? Infinity) - (b.etaMinutes ?? Infinity);
+  });
 
 app.post('/api/arrivals', auth(['passenger']), async (req, res) => {
   // Passenger's current GPS position.
@@ -1502,8 +1751,8 @@ app.post('/api/arrivals', auth(['passenger']), async (req, res) => {
   const accuracy = Number.isFinite(reportedAccuracy) && reportedAccuracy >= 0 ? reportedAccuracy : null;
 
   /*
-    Optional passenger selections. A missing stop means "nearest stop on that bus's route";
-    the destination is only needed once the passenger is on board.
+    Optional passenger selections. A missing stop means "nearest stop (by road) on the eligible
+    route(s)"; the destination is only needed once the passenger is on board.
   */
   const selection = {
     busId: cleanOrNull(req.body.busId),
@@ -1511,49 +1760,26 @@ app.post('/api/arrivals', auth(['passenger']), async (req, res) => {
     destinationStopId: cleanOrNull(req.body.destinationStopId)
   };
 
+  const userId = req.user.id;
   cleanupJourneyState();
 
-  // Only buses with a recent GPS update are considered live.
+  // Only buses with a recent, valid GPS update are considered live. Positions are never invented.
   const live = activeBuses();
 
-  const detection = detectBoarding(req.user.id, live, location, accuracy);
-  const journeyState = advanceJourney(req.user.id, detection, selection, location);
+  // 1) Pickup stop. After boarding it stays locked to the boarding stop.
+  const prior = journeys.get(userId);
+  const priorActive = !!prior && (prior.phase !== 'completed' || Date.now() - prior.completedAt <= COMPLETED_RETENTION_MS);
 
-  // Promise.allSettled means one failed lookup does not break all buses.
-  const results = await Promise.allSettled(live.map(bus => buildArrival(bus, location, selection, detection.trackers)));
+  let pickup = null;
+  try {
+    pickup = priorActive ? lockedPickup(prior) : await resolvePickup(userId, location, selection);
+  } catch (error) {
+    console.error('Pickup stop selection failed:', error?.message || error);
+  }
 
-  const arrivals = results.map((result, index) => {
-    if (result.status === 'fulfilled') return result.value;
-
-    const bus = live[index];
-    console.error(`Arrival calculation failed for bus ${bus?.id}:`, result.reason?.message || result.reason);
-
-    // Keep the bus visible even when its ETA cannot be calculated.
-    return {
-      ...bus,
-      etaMinutes: null,
-      etaSource: null,
-      distanceMeters: null,
-      distanceKm: null,
-      gpsDistanceMeters: null,
-      hasArrived: false,
-      boardingStop: null,
-      boardingStopIndex: -1,
-      boardingStopAuto: true,
-      stopDistanceMeters: null,
-      routeStops: [],
-      roadRoute: null,
-      speedKmh: Number.isFinite(bus?.speedKmh) ? bus.speedKmh : null,
-      inService: true,
-      boardingProgress: { matches: 0, required: BOARDING_CONSECUTIVE_UPDATES }
-    };
-  });
-
-  // Arrived buses sort before all others, then by ETA. Buses without an ETA go to the bottom.
-  arrivals.sort((a, b) => {
-    if (a.hasArrived !== b.hasArrived) return a.hasArrived ? -1 : 1;
-    return (a.etaMinutes ?? Infinity) - (b.etaMinutes ?? Infinity);
-  });
+  // 2) Boarding detection + journey state.
+  const detection = detectBoarding(userId, live, location, accuracy, pickup?.stop?.id || null);
+  const journeyState = advanceJourney(userId, detection, selection, location);
 
   let journey = null;
   try {
@@ -1562,11 +1788,51 @@ app.post('/api/arrivals', auth(['passenger']), async (req, res) => {
     console.error('Journey update failed:', error?.message || error);
   }
 
+  const journeyActive = !!journey && ['boarded', 'in_journey', 'completed'].includes(journey.phase);
+  if (journeyActive && !pickup?.locked) pickup = lockedPickup(journeyState) || pickup;
+
+  // 3) Arrivals.
+  let arrivals = [];
+  let message = null;
+
+  if (journeyActive) {
+    const journeyBus = buses.get(journey.busId);
+    arrivals = journeyBus ? [journeyArrival(journeyBus, journey)] : [];
+  } else if (pickup) {
+    const pickupStop = transit.stopsById.get(pickup.stop.id);
+
+    // Only live buses whose assigned route actually contains the pickup stop.
+    const serving = live.filter(bus => routeOf(bus)?.stops.includes(pickupStop.id));
+
+    // Promise.allSettled means one failed lookup does not break all buses.
+    const results = await Promise.allSettled(serving.map(bus => buildArrival(bus, pickupStop, detection.trackers)));
+
+    arrivals = sortArrivals(
+      results.map((result, index) => {
+        if (result.status === 'fulfilled') return result.value;
+        console.error(`Arrival calculation failed for bus ${serving[index]?.id}:`, result.reason?.message || result.reason);
+        return fallbackArrival(serving[index], pickupStop);
+      })
+    );
+
+    if (!live.length) message = 'No live bus data';
+    else if (!serving.length) message = `No live bus data for buses serving ${pickup.stop.name}`;
+  } else {
+    message = live.length ? 'No bus stop could be found near you.' : 'No live bus data';
+  }
+
+  const routingConfigured = Boolean(process.env.GOOGLE_ROUTES_API_KEY);
+
   res.json({
     location,
+    pickup,
     arrivals,
     journey,
-    provider: process.env.GOOGLE_ROUTES_API_KEY ? 'Google Routes API' : 'unavailable',
+    liveBusCount: live.length,
+    noLiveBus: !journeyActive && arrivals.length === 0,
+    message,
+    routingWarning: routingConfigured ? null : 'Road routing is unavailable: GOOGLE_ROUTES_API_KEY is not configured on the server.',
+    provider: routingConfigured ? 'Google Routes API' : 'unavailable',
     updatedAt: Date.now()
   });
 });
@@ -1585,6 +1851,12 @@ app.post('/api/journey/start', auth(['passenger']), (req, res) => {
 
   const stops = routeStopObjects(routeOf(bus));
   let currentStop = stops.find(stop => stop.id === cleanOrNull(req.body.stopId)) || null;
+
+  // The pickup stop the passenger was last given, if this bus serves it.
+  if (!currentStop) {
+    const pickedId = pickups.get(req.user.id)?.stopId;
+    currentStop = pickedId ? stops.find(stop => stop.id === pickedId) || null : null;
+  }
 
   if (!currentStop) {
     const location = { lat: Number(req.body.lat), lng: Number(req.body.lng) };
@@ -1635,6 +1907,7 @@ app.post('/api/journey/end', auth(['passenger']), (req, res) => {
   }
 
   journeys.delete(req.user.id);
+  pickups.delete(req.user.id);
   clearTrackersFor(req.user.id);
 
   res.status(204).end();
