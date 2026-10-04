@@ -568,6 +568,150 @@ function activeBuses() {
 }
 
 /* =========================
+   SPEED & ARRIVAL
+========================= */
+
+/*
+  A bus is considered "arrived" once it is this close to
+  the passenger, measured with GPS/Haversine distance (not
+  Google's road distance), checked against the exact
+  (unrounded) distance in meters.
+*/
+const ARRIVAL_THRESHOLD_METERS = 20;
+
+/*
+  Speed-based ETA is only trusted when the bus's last
+  computed speed is at least this fast. Anything slower
+  (including exactly 0, a stopped bus) falls back to
+  Google's traffic-aware duration instead of implying a
+  huge or infinite ETA.
+*/
+const MIN_RELIABLE_SPEED_KMH = 1;
+
+/*
+  Any computed speed above this is treated as GPS
+  noise/a position jump rather than real bus movement,
+  and is rejected (stored as null for that update).
+*/
+const MAX_REALISTIC_SPEED_KMH = 100;
+
+function haversineMeters(
+  lat1,
+  lng1,
+  lat2,
+  lng2
+) {
+  const earthRadiusMeters = 6371000;
+
+  const toRad = degrees =>
+    (degrees * Math.PI) / 180;
+
+  const dLat =
+    toRad(lat2 - lat1);
+
+  const dLng =
+    toRad(lng2 - lng1);
+
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLng / 2) ** 2;
+
+  return (
+    2 *
+    earthRadiusMeters *
+    Math.asin(
+      Math.min(1, Math.sqrt(a))
+    )
+  );
+}
+
+/*
+  Computes a bus's current speed (km/h) from its previous
+  reported position/timestamp vs. its new one. The caller
+  passes the bus's own previously stored lat/lng/updatedAt
+  as "previous" — there is no separate history store.
+
+  Returns null — never NaN, Infinity, or negative — whenever
+  the speed cannot be trusted:
+    - no previous position (first GPS update for this bus)
+    - either timestamp is missing/invalid
+    - zero or negative elapsed time (clock skew, out-of-order
+      or duplicate updates)
+    - a speed above MAX_REALISTIC_SPEED_KMH, which looks like
+      GPS noise or a position jump rather than real movement
+
+  A real elapsed time with 0 distance correctly returns 0
+  (a stationary bus) rather than null.
+*/
+function computeSpeedKmh(
+  previous,
+  next
+) {
+  if (
+    !previous ||
+    !Number.isFinite(previous.lat) ||
+    !Number.isFinite(previous.lng) ||
+    !Number.isFinite(previous.updatedAt)
+  ) {
+    return null;
+  }
+
+  if (
+    !Number.isFinite(next.lat) ||
+    !Number.isFinite(next.lng) ||
+    !Number.isFinite(next.updatedAt)
+  ) {
+    return null;
+  }
+
+  const elapsedMs =
+    next.updatedAt - previous.updatedAt;
+
+  if (
+    !Number.isFinite(elapsedMs) ||
+    elapsedMs <= 0
+  ) {
+    return null;
+  }
+
+  const distanceMeters =
+    haversineMeters(
+      previous.lat,
+      previous.lng,
+      next.lat,
+      next.lng
+    );
+
+  if (
+    !Number.isFinite(distanceMeters) ||
+    distanceMeters < 0
+  ) {
+    return null;
+  }
+
+  const elapsedHours =
+    elapsedMs / 3600000;
+
+  const speedKmh =
+    distanceMeters / 1000 / elapsedHours;
+
+  if (
+    !Number.isFinite(speedKmh) ||
+    speedKmh < 0
+  ) {
+    return null;
+  }
+
+  if (speedKmh > MAX_REALISTIC_SPEED_KMH) {
+    return null;
+  }
+
+  return speedKmh;
+}
+
+/* =========================
    GOOGLE ROUTES / ETA
 ========================= */
 
@@ -1389,38 +1533,48 @@ app.post(
       await Promise.allSettled(
         live.map(
           async bus => {
-            const route =
-              await routeToLocation(
-                bus,
-                location
-              );
-
             /*
-              Calculate ETA from Google's
-              traffic-aware duration.
+              Arrival detection uses GPS/Haversine distance
+              between the bus's own last reported position and
+              the passenger — NOT Google's road distance. This
+              is computed synchronously and does not depend on
+              the Google Routes call below.
             */
-            const etaMinutes =
-              route &&
-              Number.isFinite(
-                route.durationSeconds
-              )
-                ? Math.max(
-                    1,
-                    Math.ceil(
-                      route.durationSeconds /
-                        60
-                    )
+            const gpsDistanceMeters =
+              Number.isFinite(bus.lat) &&
+              Number.isFinite(bus.lng)
+                ? haversineMeters(
+                    bus.lat,
+                    bus.lng,
+                    location.lat,
+                    location.lng
                   )
                 : null;
 
-            /*
-              Keep the exact road distance
-              in meters.
+            const hasArrived =
+              gpsDistanceMeters !== null &&
+              gpsDistanceMeters <=
+                ARRIVAL_THRESHOLD_METERS;
 
-              DO NOT round this before
-              checking the arrival threshold.
+            /*
+              Skip the Google Routes call entirely once the bus
+              has already arrived — there is nothing left to
+              estimate, and it saves an API call.
             */
-            const distanceMeters =
+            const route = hasArrived
+              ? null
+              : await routeToLocation(
+                  bus,
+                  location
+                );
+
+            /*
+              Keep the exact road distance in meters, used for
+              display (distanceMeters/distanceKm) and as part of
+              the Google-duration ETA fallback. This is separate
+              from the GPS distance used for arrival detection.
+            */
+            const roadDistanceMeters =
               route &&
               Number.isFinite(
                 route.distanceMeters
@@ -1429,13 +1583,15 @@ app.post(
                 : null;
 
             /*
-              Bus is considered ARRIVED when
-              it is 5 meters or less from
-              the passenger.
+              Prefer the Google road distance for display when
+              available (it reflects actual travel distance);
+              otherwise fall back to the straight-line GPS
+              distance so the UI still has something to show.
             */
-            const hasArrived =
-              distanceMeters !== null &&
-              distanceMeters <= 5;
+            const distanceMeters =
+              roadDistanceMeters !== null
+                ? roadDistanceMeters
+                : gpsDistanceMeters;
 
             /*
               Distance in kilometers is still
@@ -1451,6 +1607,76 @@ app.post(
                   )
                 : null;
 
+            /*
+              The bus's own current speed, derived
+              from consecutive GPS updates at the
+              hardware/driver-location endpoints.
+              null means no reliable speed is known.
+            */
+            const speedKmh =
+              Number.isFinite(
+                bus.speedKmh
+              )
+                ? bus.speedKmh
+                : null;
+
+            const speedReliable =
+              speedKmh !== null &&
+              speedKmh >=
+                MIN_RELIABLE_SPEED_KMH;
+
+            /*
+              ETA priority:
+                1. Arrived (GPS distance <= threshold) -> 0
+                2. GPS distance / current speed, when the
+                   speed is known and realistic
+                3. Google's traffic-aware duration
+                4. null ("Calculating..." on the frontend)
+            */
+            let etaMinutes = null;
+
+            if (hasArrived) {
+              etaMinutes = 0;
+            } else if (
+              gpsDistanceMeters !== null &&
+              speedReliable
+            ) {
+              const minutes =
+                (gpsDistanceMeters /
+                  1000 /
+                  speedKmh) *
+                60;
+
+              etaMinutes =
+                Number.isFinite(
+                  minutes
+                ) && minutes >= 0
+                  ? Math.max(
+                      1,
+                      Math.ceil(
+                        minutes
+                      )
+                    )
+                  : null;
+            }
+
+            if (
+              etaMinutes === null &&
+              !hasArrived &&
+              route &&
+              Number.isFinite(
+                route.durationSeconds
+              )
+            ) {
+              etaMinutes = Math.max(
+                1,
+                Math.ceil(
+                  route.durationSeconds /
+                    60
+                )
+              );
+            }
+
             return {
               ...bus,
 
@@ -1460,7 +1686,8 @@ app.post(
               etaMinutes,
 
               /*
-                Exact Google road distance.
+                Display distance: Google road distance when
+                available, otherwise GPS straight-line distance.
               */
               distanceMeters,
 
@@ -1470,8 +1697,9 @@ app.post(
               distanceKm,
 
               /*
-                TRUE when the bus is within
-                5 meters of the passenger.
+                TRUE when the GPS/Haversine distance between the
+                bus and the passenger is within
+                ARRIVAL_THRESHOLD_METERS.
               */
               hasArrived,
 
@@ -1480,7 +1708,13 @@ app.post(
                 the frontend map.
               */
               roadRoute:
-                route
+                route,
+
+              /*
+                The bus's current speed (km/h),
+                when reliably known.
+              */
+              speedKmh
             };
           }
         )
@@ -1506,36 +1740,85 @@ app.post(
           );
 
           /*
+            Even if the Google Routes lookup failed, still
+            check GPS arrival so the bus doesn't get stuck
+            showing "Calculating..." right as it arrives.
+          */
+          const gpsDistanceMeters =
+            Number.isFinite(bus?.lat) &&
+            Number.isFinite(bus?.lng)
+              ? haversineMeters(
+                  bus.lat,
+                  bus.lng,
+                  location.lat,
+                  location.lng
+                )
+              : null;
+
+          const hasArrived =
+            gpsDistanceMeters !== null &&
+            gpsDistanceMeters <=
+              ARRIVAL_THRESHOLD_METERS;
+
+          /*
             Keep the bus visible even when
             Google cannot calculate its ETA.
           */
           return {
             ...bus,
 
-            etaMinutes: null,
+            etaMinutes:
+              hasArrived ? 0 : null,
 
-            distanceMeters: null,
+            distanceMeters:
+              gpsDistanceMeters,
 
-            distanceKm: null,
+            distanceKm:
+              gpsDistanceMeters !== null
+                ? Number(
+                    (
+                      gpsDistanceMeters /
+                      1000
+                    ).toFixed(3)
+                  )
+                : null,
 
-            hasArrived: false,
+            hasArrived,
 
-            roadRoute: null
+            roadRoute: null,
+
+            speedKmh:
+              Number.isFinite(
+                bus?.speedKmh
+              )
+                ? bus.speedKmh
+                : null
           };
         }
       );
 
     /*
-      Sort buses by ETA.
-
-      Buses without an ETA go to the bottom.
+      Arrived buses sort before all others, then
+      by ETA. Buses without an ETA go to the bottom.
     */
     arrivals.sort(
-      (a, b) =>
-        (a.etaMinutes ??
-          Infinity) -
-        (b.etaMinutes ??
-          Infinity)
+      (a, b) => {
+        if (
+          a.hasArrived !==
+          b.hasArrived
+        ) {
+          return a.hasArrived
+            ? -1
+            : 1;
+        }
+
+        return (
+          (a.etaMinutes ??
+            Infinity) -
+          (b.etaMinutes ??
+            Infinity)
+        );
+      }
     );
 
     res.json({
@@ -1632,6 +1915,35 @@ app.post(
           ).getTime()
         : Date.now();
 
+    const updatedAt =
+      Number.isFinite(
+        parsedSentAt
+      )
+        ? parsedSentAt
+        : Date.now();
+
+    /*
+      Speed is derived from this bus's own previous
+      reported position/timestamp vs. this new one.
+      computeSpeedKmh rejects first updates, invalid
+      timestamps, non-positive elapsed time, and
+      unrealistic GPS jumps by returning null.
+    */
+    const speedKmh =
+      computeSpeedKmh(
+        {
+          lat: existing.lat,
+          lng: existing.lng,
+          updatedAt:
+            existing.updatedAt
+        },
+        {
+          lat: latitude,
+          lng: longitude,
+          updatedAt
+        }
+      );
+
     const position = {
       ...existing,
 
@@ -1659,12 +1971,9 @@ app.post(
           ? Number(accuracy)
           : null,
 
-      updatedAt:
-        Number.isFinite(
-          parsedSentAt
-        )
-          ? parsedSentAt
-          : Date.now(),
+      updatedAt,
+
+      speedKmh,
 
       source:
         'hardware'
@@ -1733,6 +2042,29 @@ app.post(
         });
     }
 
+    const updatedAt =
+      Date.now();
+
+    /*
+      Same speed derivation as the hardware endpoint,
+      so ETA stays reliable while a driver's device is
+      the active location source.
+    */
+    const speedKmh =
+      computeSpeedKmh(
+        {
+          lat: existing.lat,
+          lng: existing.lng,
+          updatedAt:
+            existing.updatedAt
+        },
+        {
+          lat: latitude,
+          lng: longitude,
+          updatedAt
+        }
+      );
+
     const position = {
       ...existing,
 
@@ -1751,8 +2083,9 @@ app.post(
 
       occupancy,
 
-      updatedAt:
-        Date.now(),
+      updatedAt,
+
+      speedKmh,
 
       source:
         'driver'
