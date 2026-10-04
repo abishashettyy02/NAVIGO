@@ -223,22 +223,41 @@ function loadWorkbook() {
       stopsById.set(stop.id, stop);
     }
 
-    /* ---- Schedules from Bus_Schedule, matched to buses by "BUS NO.|BUS" (or by bus number alone) ---- */
-    const scheduleByKey = new Map();
-    const schedulesByNumber = new Map();
+    /*
+      ---- Bus_Schedule: the ONLY source of BUS IDs ----
+      Every usable row needs a "BUS ID." (B001, B011, ...). IDs are never generated from row order.
+      Each Route_Master row is then matched to exactly one Bus_Schedule row (see the matching passes below).
+    */
     const timetableRows = [];
+    const scheduleEntries = [];
+    const seenBusIds = new Set();
+
+    // "Moodushedde -> Statebank (via Kulshekar)" -> ['moodushedde', 'statebank'] (first and last point only).
+    const routeEnds = text => {
+      const parts = String(text ?? '')
+        .replace(/\(.*?\)/g, ' ')
+        .split(/\s*(?:→|->)\s*/)
+        .map(part => slug(part))
+        .filter(Boolean);
+      return parts.length >= 2 ? [parts[0], parts[parts.length - 1]] : null;
+    };
+    // "kulshekar" and "kulshekar-chowki" are the same terminus.
+    const sameName = (a, b) => !!a && !!b && (a === b || a.startsWith(`${b}-`) || b.startsWith(`${a}-`));
+    const sameEnds = (a, b) => !!a && !!b && ((sameName(a[0], b[0]) && sameName(a[1], b[1])) || (sameName(a[0], b[1]) && sameName(a[1], b[0])));
 
     for (const row of sheetRows(scheduleSheet)) {
+      const busId = cleanText(field(row, 'busid')).toUpperCase();
       const busNo = cleanText(field(row, 'busno'));
       const operator = cleanText(field(row, 'bus'));
       const routeText = cleanText(field(row, 'route'));
-      if (!operator && !busNo && !routeText) continue;
+      if (!busId && !operator && !busNo && !routeText) continue;
 
       const firstDepartureMin = parseClock(field(row, 'draftfirstdeparture', 'firstdeparture'));
       const lastDepartureMin = parseClock(field(row, 'draftlastdeparture', 'lastdeparture'));
       const headway = toFinite(field(row, 'headwaymin', 'headway'));
 
       const schedule = {
+        busId: busId || null,
         direction: cleanText(field(row, 'direction')) || null,
         firstDeparture: formatClock(firstDepartureMin),
         lastDeparture: formatClock(lastDepartureMin),
@@ -249,39 +268,74 @@ function loadWorkbook() {
         note: cleanText(field(row, 'note')) || null
       };
 
-      const key = `${slug(busNo)}|${slug(operator)}`;
-      if (!scheduleByKey.has(key)) scheduleByKey.set(key, schedule);
-      if (busNo) {
-        const list = schedulesByNumber.get(slug(busNo)) || [];
-        list.push(schedule);
-        schedulesByNumber.set(slug(busNo), list);
-      }
-
       timetableRows.push({
         Route: routeText,
         route: routeText,
+        busId: busId || null,
         busNo: busNo || null,
         operator,
         ...schedule
       });
+
+      if (!busId) {
+        console.warn(`Bus_Schedule row "${cleanText(`${busNo} ${operator} ${routeText}`)}" has no BUS ID and cannot be used for tracking.`);
+        continue;
+      }
+      if (seenBusIds.has(busId)) {
+        console.warn(`Bus_Schedule lists BUS ID ${busId} more than once; only the first row is used.`);
+        continue;
+      }
+      seenBusIds.add(busId);
+
+      scheduleEntries.push({ busId, busNo, operator, routeText, ends: routeEnds(routeText), schedule, claimed: false });
     }
 
-    // Exact "number|operator" match first; otherwise a bus number that has exactly one schedule row.
-    const scheduleFor = (number, operator) => {
-      const exact = scheduleByKey.get(`${slug(number)}|${slug(operator)}`);
-      if (exact) return exact;
-      const sameNumber = number ? schedulesByNumber.get(slug(number)) : null;
-      return sameNumber && sameNumber.length === 1 ? sameNumber[0] : null;
-    };
+    /* ---- Route_Master rows (one row = one bus on one route), matched to Bus_Schedule rows ---- */
+    const routeInfos = sheetRows(routeSheet).map(row => {
+      const point1 = cleanText(field(row, 'point1'));
+      const point2 = cleanText(field(row, 'point2'));
+      return {
+        row,
+        number: cleanText(field(row, 'busno')),
+        operator: cleanText(field(row, 'bus')),
+        ends: point1 && point2 ? [slug(point1), slug(point2)] : null,
+        entry: null
+      };
+    });
 
-    /* ---- Routes + buses from Route_Master (one row = one bus on one route) ---- */
+    /*
+      Matching passes, strongest first; each Bus_Schedule row can be claimed once:
+        1. BUS NO. + BUS (operator) both equal
+        2. BUS (operator) + route end points equal (covers blank BUS NO., e.g. Mahesh / Celina to Puttur)
+        3. BUS NO. alone, when exactly one unclaimed Bus_Schedule row carries it (operator names may differ)
+    */
+    const sameNumber = (a, b) => !!a.number && !!b.busNo && slug(a.number) === slug(b.busNo);
+    const sameOperator = (a, b) => !!a.operator && slug(a.operator) === slug(b.operator);
+    const passes = [
+      (info, entry) => sameNumber(info, entry) && sameOperator(info, entry),
+      (info, entry) => sameOperator(info, entry) && sameEnds(info.ends, entry.ends) && (!info.number || !entry.busNo || sameNumber(info, entry)),
+      (info, entry) => sameNumber(info, entry)
+    ];
+    passes.forEach((matches, passIndex) => {
+      for (const info of routeInfos) {
+        if (info.entry) continue;
+        const candidates = scheduleEntries.filter(entry => !entry.claimed && matches(info, entry));
+        if (passIndex === 2 ? candidates.length !== 1 : !candidates.length) continue;
+        info.entry = candidates[0];
+        info.entry.claimed = true;
+      }
+    });
+    for (const entry of scheduleEntries) {
+      if (!entry.claimed) console.warn(`Bus_Schedule BUS ID ${entry.busId} (${entry.busNo || 'no number'} ${entry.operator}) matches no Route_Master row.`);
+    }
+
+    /* ---- Routes + buses ---- */
     const routes = [];
     const routesById = new Map();
     const busList = [];
 
-    sheetRows(routeSheet).forEach((row, index) => {
-      const number = cleanText(field(row, 'busno'));
-      const operator = cleanText(field(row, 'bus'));
+    routeInfos.forEach(info => {
+      const { row, number, operator, entry } = info;
 
       const stopColumns = Object.keys(row)
         .filter(key => /^stop\d+$/.test(normKey(key)))
@@ -327,22 +381,41 @@ function loadWorkbook() {
         console.warn(`Route ${label} skipped: fewer than two usable stops.`);
         return;
       }
+      if (!entry) {
+        console.warn(`Route ${label} skipped: no matching BUS ID in Bus_Schedule.`);
+        return;
+      }
 
       const firstStop = stopsById.get(stopIds[0]);
       const lastStop = stopsById.get(stopIds[stopIds.length - 1]);
-      const point1 = cleanText(field(row, 'point1')) || firstStop.name;
-      const point2 = cleanText(field(row, 'point2')) || lastStop.name;
-      const routeNumber = number || point2.toUpperCase();
+      let point1 = cleanText(field(row, 'point1')) || firstStop.name;
+      let point2 = cleanText(field(row, 'point2')) || lastStop.name;
+
+      /*
+        Direction: Route_Master lists stops in one direction only. When Bus_Schedule's ROUTE runs the other way
+        (e.g. B011 "Moodushedde -> Statebank" while Route_Master lists Statebank first), the stop order is reversed
+        so "stops after the boarding stop" really are the stops this bus will reach next.
+      */
+      const scheduleStart = entry.ends?.[0];
+      const scheduleEnd = entry.ends?.[1];
+      const reversed = !!scheduleStart && sameName(scheduleStart, slug(lastStop.name)) && sameName(scheduleEnd, slug(firstStop.name)) && !sameName(scheduleStart, scheduleEnd);
+      if (reversed) {
+        stopIds.reverse();
+        [point1, point2] = [point2, point1];
+      }
+
+      const routeNumber = number || entry.busNo || point2.toUpperCase();
 
       let routeId = `${slug(routeNumber)}-${slug(operator) || 'bus'}`;
       for (let suffix = 2; routesById.has(routeId); suffix += 1) {
         routeId = `${slug(routeNumber)}-${slug(operator) || 'bus'}-${suffix}`;
       }
 
-      const schedule = scheduleFor(number, operator);
+      const schedule = entry.schedule;
 
       const route = {
         id: routeId,
+        busId: entry.busId,
         number: routeNumber,
         name: `${prettyName(point1)} → ${prettyName(point2)}`,
         operator,
@@ -354,7 +427,7 @@ function loadWorkbook() {
       routesById.set(route.id, route);
 
       busList.push({
-        id: `B${String(index + 1).padStart(3, '0')}`,
+        id: entry.busId, // BUS ID. column of Bus_Schedule
         routeId: route.id,
         number: route.number,
         routeName: route.name,
@@ -469,6 +542,12 @@ const deviceRegistry = new Map(
     ])
 );
 
+if (transit.loaded) {
+  for (const [deviceId, device] of deviceRegistry) {
+    if (!buses.has(device.busId)) console.warn(`Device ${deviceId} is assigned to ${device.busId}, which is not a BUS ID in Bus_Schedule.`);
+  }
+}
+
 /*
   Brevo email service.
 
@@ -570,7 +649,11 @@ const MAX_REALISTIC_SPEED_KMH = 100;
 const BUS_FRESHNESS_MS = 5 * 60 * 1000;
 const COMPLETED_RETENTION_MS = 2 * 60 * 1000;
 const TRACKER_TTL_MS = 10 * 60 * 1000;
-const JOURNEY_TTL_MS = 6 * 60 * 60 * 1000;
+/*
+  A journey is dropped when its passenger has not polled for this long (closed tab, lost connection, restarted
+  session), so an old journey can never reappear as "Journey in progress". It is also cleared on every sign-in.
+*/
+const JOURNEY_IDLE_MS = 10 * 60 * 1000;
 
 /*
   Pickup-stop selection. The nearest few stops (by straight line, used only to shortlist) are
@@ -916,8 +999,8 @@ app.get('/api/timetable', (req, res) => {
     transit.rows
       .filter(row => {
         if (!wanted) return true;
-        const matchingRoutes = transit.routes.filter(route => slug(route.number) === slug(row.busNo) && slug(route.operator) === slug(row.operator));
-        return slug(row.route) === wanted || slug(row.busNo) === wanted || matchingRoutes.some(route => route.id === wanted);
+        const matchingRoutes = transit.routes.filter(route => route.busId && route.busId === row.busId);
+        return slug(row.route) === wanted || slug(row.busNo) === wanted || slug(row.busId) === wanted || matchingRoutes.some(route => route.id === wanted);
       })
       .slice(0, 12)
   );
@@ -1107,6 +1190,7 @@ app.post('/api/auth/verify-code', (req, res) => {
   };
 
   saveUser(user);
+  resetPassengerState(user.id);
 
   pendingCodes.delete(user.email);
 
@@ -1134,6 +1218,8 @@ app.post('/api/auth/login', async (req, res) => {
       message: 'Enter the bus ID assigned to this driver account.'
     });
   }
+
+  resetPassengerState(user.id);
 
   res.json({
     token: tokenFor(user),
@@ -1378,7 +1464,7 @@ function cleanupJourneyState() {
   }
 
   for (const [key, journey] of journeys) {
-    if (now - journey.lastSeenAt > JOURNEY_TTL_MS) journeys.delete(key);
+    if (now - journey.lastSeenAt > JOURNEY_IDLE_MS) journeys.delete(key);
   }
 
   for (const [key, pickup] of pickups) {
@@ -1390,6 +1476,13 @@ function clearTrackersFor(userId) {
   for (const key of boardingTrackers.keys()) {
     if (key.startsWith(`${userId}|`)) boardingTrackers.delete(key);
   }
+}
+
+// A new sign-in / verified registration starts a fresh passenger session: no journey, pickup or boarding streak carries over.
+function resetPassengerState(userId) {
+  journeys.delete(userId);
+  pickups.delete(userId);
+  clearTrackersFor(userId);
 }
 
 /*
@@ -1935,6 +2028,12 @@ app.post('/api/device/coordinates', assertDevice, (req, res) => {
   if (!device) {
     return res.status(403).json({
       message: 'This device is not assigned to a bus in the backend registry.'
+    });
+  }
+
+  if (transit.loaded && !buses.has(device.busId)) {
+    return res.status(403).json({
+      message: `Device bus ${device.busId} is not a BUS ID in the Bus_Schedule sheet.`
     });
   }
 
