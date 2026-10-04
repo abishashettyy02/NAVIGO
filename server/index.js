@@ -555,6 +555,13 @@ const BOARDING_SUPPRESS_MS = 10 * 60 * 1000;
 const MIN_RELIABLE_SPEED_KMH = 1;
 
 /*
+  After boarding, the ETA/route is the boarding stop -> destination stop leg (the same road route
+  as the dark-blue line). Set JOURNEY_ETA_FROM_BUS=true to instead count down live from the bus's
+  current position to the destination.
+*/
+const JOURNEY_ETA_FROM_BUS = process.env.JOURNEY_ETA_FROM_BUS === 'true';
+
+/*
   Any computed speed above this is treated as GPS noise/a position jump rather than real bus
   movement, and is rejected (stored as null for that update).
 */
@@ -1204,13 +1211,11 @@ function lockedPickup(journey) {
 }
 
 async function resolvePickup(userId, location, selection) {
-  const pool = eligibleStopPool(selection);
-  if (!pool.length) return null;
-
   const now = Date.now();
 
-  // 1) The passenger picked a stop: use it and just draw the road route to it.
-  const chosen = selection.stopId ? pool.find(stop => stop.id === selection.stopId) : null;
+  // 1) The passenger picked a stop: use exactly that stop (any stop a route serves) and draw the road route to it.
+  //    It is never swapped for a different "nearest" stop, so the bus ETA stays bus -> the selected stop.
+  const chosen = selection.stopId ? eligibleStopPool({}).find(stop => stop.id === selection.stopId) : null;
   if (chosen) {
     let route = null;
     try {
@@ -1223,6 +1228,9 @@ async function resolvePickup(userId, location, selection) {
   }
 
   // 2) Automatic: shortlist by straight line, then rank the shortlist by Google road distance.
+  const pool = eligibleStopPool(selection);
+  if (!pool.length) return null;
+
   const ranked = pool
     .map(stop => ({ stop, meters: gpsDistance(stop, location) }))
     .filter(item => item.meters !== null)
@@ -1505,7 +1513,7 @@ function advanceJourney(userId, detection, selection, location) {
   return journey;
 }
 
-/* Passenger-facing journey object (includes the DARK BLUE road route and the ROAD ETA to the destination). */
+/* Passenger-facing journey object (includes the DARK BLUE road route and the ROAD ETA for boarding stop -> destination stop). */
 async function buildJourneyView(journey) {
   if (!journey) return null;
 
@@ -1565,9 +1573,10 @@ async function buildJourneyView(journey) {
     console.error(`Journey route failed for bus ${journey.busId}:`, error?.message || error);
   }
 
-  // Live ETA: road distance/duration from the bus's CURRENT position to the destination stop.
-  let etaRoute = null;
-  if (fresh) {
+  // ETA after boarding = boarding stop -> destination stop (the same road route as the dark-blue line).
+  // With JOURNEY_ETA_FROM_BUS=true it is instead the live road ETA from the bus's current position to the destination.
+  let etaRoute = staticRoute;
+  if (JOURNEY_ETA_FROM_BUS && fresh) {
     try {
       // Skip the stop the bus is at/just passed; pass through the remaining stops before the destination.
       let progress = from;
@@ -1581,12 +1590,13 @@ async function buildJourneyView(journey) {
       }
       const remaining = stops.slice(progress + 1, to);
 
-      etaRoute = await cachedRoute(
-        `eta:${bus.id}>${destination.id}`,
-        `${positionFingerprint(bus)}|${remaining.map(stop => stop.id).join(',')}`,
-        ROUTE_TTL_MS,
-        () => routeToLocation(bus, destination, remaining)
-      );
+      etaRoute =
+        (await cachedRoute(
+          `eta:${bus.id}>${destination.id}`,
+          `${positionFingerprint(bus)}|${remaining.map(stop => stop.id).join(',')}`,
+          ROUTE_TTL_MS,
+          () => routeToLocation(bus, destination, remaining)
+        )) || staticRoute;
     } catch (error) {
       console.error(`Destination ETA failed for bus ${journey.busId}:`, error?.message || error);
     }
@@ -1598,7 +1608,7 @@ async function buildJourneyView(journey) {
   return {
     ...view,
     etaMinutes,
-    etaStatus: !fresh ? 'no-live-data' : etaMinutes !== null ? 'ok' : 'unavailable',
+    etaStatus: etaMinutes !== null ? 'ok' : fresh ? 'unavailable' : 'no-live-data',
     distanceMeters: roadDistance,
     distanceKm: kmFrom(roadDistance),
     roadRoute: staticRoute || etaRoute
@@ -1701,7 +1711,7 @@ function fallbackArrival(bus, pickupStop) {
   };
 }
 
-// While a journey is active the list shows only the passenger's bus, with the ETA to their destination.
+// While a journey is active the list shows only the passenger's bus, with the ETA for their boarding -> destination leg.
 function journeyArrival(bus, view) {
   const stops = routeStopObjects(routeOf(bus));
   const targetStop = view.destination || view.currentStop || null;

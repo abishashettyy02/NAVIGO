@@ -375,10 +375,10 @@ function Dashboard({ session, logout }) {
   }, [hasLocation]);
   function chooseBus(item) {
     setSelected(item);
-    setStopId('');
     const onRoute = (item.routeStops || []).some(s => s.id === destinationId);
     if (!onRoute) setDestinationId('');
-    calculate({ busId: item.id, stopId: null, destinationStopId: onRoute ? destinationId : null });
+    // Keep the passenger's source stop: every listed bus serves it, so the ETA stays live bus GPS -> that stop.
+    calculate({ busId: item.id, stopId: stopId || pickup?.stop?.id || null, destinationStopId: onRoute ? destinationId : null });
   }
   function changeStop(value) {
     setStopId(value);
